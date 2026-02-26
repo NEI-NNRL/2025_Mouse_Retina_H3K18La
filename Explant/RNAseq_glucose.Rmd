@@ -1,0 +1,357 @@
+---
+title: "Glucose Explant RNA-seq"
+output: html_notebook
+---
+
+
+### Get meta file
+```{r}
+meta <- read.csv("meta.csv", stringsAsFactors = F)
+meta
+
+```
+
+
+### Experiment sample details - Eliminate samples/levels if needed
+```{r, results="hide"}
+## Number of samples and levels
+nm <- dim(meta)[1]
+expt.pheno <- factor(meta$Glucose)
+nm.lvl <- length(levels(expt.pheno))
+
+## Order of samples
+ord <- c(1:nm)
+ord.lvl <- unique(as.vector(expt.pheno))
+
+## Remove outlier samples, if needed
+remove.samp <- c() #Remove a sample(s)
+
+## Make grp and export suffixes
+if (!is.null(remove.samp)){
+  grp <- factor(expt.pheno[ord[-remove.samp]], levels = ord.lvl)
+  ord <- ord[-remove.samp]
+  meta <- meta[-remove.samp,]
+} else{
+  grp <- factor(expt.pheno[ord], levels = ord.lvl)
+}
+
+
+meta$Group <- meta$Glucose_Rep
+
+```
+
+
+################################################################################
+### Project Essentials
+################################################################################
+
+#### Get transcript and gene annotation
+```{r}
+
+# Import annotation
+annot.gene <- read.csv(file = paste0("external/",short_sp,"_ENS",ens_ver,"_GeneAnnot.tsv"), sep="\t", row.names = 1)
+annot.trans <- read.csv(file = paste0("external/",short_sp,"_ENS",ens_ver,"_TransAnnot.tsv"), sep="\t", row.names = 1)
+
+# Create tx2gene needed for tximport
+tx2gene <- data.frame(cbind(as.character(row.names(annot.trans)), as.character(annot.trans$ensembl_gene_id)))
+
+```
+
+
+## Set color scheme and breaks
+```{r, results="hide"}
+library(RColorBrewer)
+## Sample colors
+label.col <- c("red","blue", "black")
+
+## Sample color palette
+colorsSampPal <- colorRampPalette(label.col)(nm.lvl)
+
+## Assign colors to samples based on grp
+colorsSamp <- colorsSampPal[grp]
+
+## Alignment plot colors
+colorsAlign <- brewer.pal(3, "Spectral")
+
+## Look at color assignments
+pie(x = rep(1,nm.lvl), col = colorsSampPal, main = "Sample Group", labels = levels(grp))
+
+# Cluster palette
+clust.pal <- brewer.pal(8, "Spectral")
+
+# Heatmap colors
+jet <- c("#7F0000","red","#FF7F00","yellow","white","cyan", "#007FFF", "blue","#00007F")
+colorsZ <- colorRampPalette(rev(jet))(1000)
+
+mb.col <- c("#023858","#3690c0","#e0f3f8","#fff7bc","#fec44f","#ec7014","#fc4e2a","#bd0026","#800026")
+colorsCPM <- colorRampPalette(mb.col)(n=1000)
+
+# Generate the breaks for the color scale
+col.breaksZ <- seq(-3, 3, length.out = 1001)
+col.breaksCPM <- seq(0,16,length = 1001)
+```
+
+
+################################################################################
+### Import Data
+################################################################################
+
+### Import kallisto data and summarize to gene-level
+```{r, results="hide"}
+library(tximport)
+library(readr)
+
+# kallisto results location
+files <- file.path(sample_dirs, "abundance.h5")
+names(files) <- paste0(meta$Glucose_Rep,"_",meta$Tech_Rep)
+
+
+## Remove files, if necessary
+files <- files[]
+#meta <- meta[-18,]
+
+## Import trans data
+trans <- tximport(files, txOut=T, type = "kallisto", importer = read_tsv, tx2gene = NULL)
+rnames <- gsub("(.+)\\..+", "\\1", row.names(trans$abundance), perl=T)
+row.names(trans$abundance) <- rnames
+row.names(trans$counts) <- rnames
+row.names(trans$length) <- rnames
+
+
+## Summarize to gene
+gene <- summarizeToGene(trans, tx2gene, countsFromAbundance = "lengthScaledTPM")
+```
+
+
+### TMM Normalize the data
+```{r}
+library(edgeR)
+
+#Transcript-level normalization
+trans.dge <- DGEList(trans$counts[,ord], group = grp, genes = annot.trans[row.names(trans$counts),])
+trans.dge <- sumTechReps(trans.dge, meta$Glucose_Rep)
+
+trans.dge <- calcNormFactors(trans.dge)
+trans.dge$rpkm <- rpkm(trans.dge, gene.length = "transcript_length")
+trans.dge$lrpkm <- log2(trans.dge$rpkm + 1)
+
+#Gene-level normalization
+gene.dge <- DGEList(gene$counts[,ord], group = grp, genes = annot.gene[row.names(gene$counts),])
+gene.dge <- sumTechReps(gene.dge, meta$Glucose_Rep)
+gene.dge <- calcNormFactors(gene.dge)
+gene.dge$cpm <- cpm(gene.dge)
+gene.dge$lcpm <- log2(gene.dge$cpm + 1)
+gene.dge$ltpm <- log2(gene$abundance[,ord] + 1)
+
+#View the data frames
+trans.dge$rpkm[1:6, 1:6]
+gene.dge$cpm[1:6, 1:6]
+```
+
+
+### Export TMM transcript and gene level data using all genes
+```{r, results="hide"}
+
+#Export raw kallisto outputs
+write.table(trans$counts, file="interim/Trans_Counts_raw.tsv", quote=F, sep="\t", col.names = NA)
+write.table(trans$abundance, file="interim/Trans_TPM_raw.tsv", quote=F, sep="\t", col.names = NA)
+write.table(trans$length, file="interim/Trans_EffLength_raw.tsv", quote=F, sep="\t", col.names = NA)
+
+write.table(gene$counts, file="interim/Gene_Counts_raw.tsv", quote=F, sep="\t", col.names = NA)
+write.table(gene$abundance, file="interim/Gene_TPM_raw.tsv", quote=F, sep="\t", col.names = NA)
+write.table(gene$length, file="interim/Gene_EffLength_raw.tsv", quote=F, sep="\t", col.names = NA)
+
+
+#Export transcript tables
+write.table(data.frame(merge(trans.dge$genes, trans.dge$rpkm, by=0), row.names=1), 
+            file="processed/Trans_RPKM_MSTR.tsv", quote=F, sep="\t", col.names = NA)
+write.table(data.frame(merge(trans.dge$genes, trans.dge$lrpkm, by=0), row.names=1), 
+            file="processed/Trans_log2RPKM_MSTR.tsv", quote=F, sep="\t", col.names = NA)
+
+
+#Export gene tables
+write.table(data.frame(merge(annot.gene, gene.dge$cpm, by=0), row.names=1), 
+            file="processed/Gene_CPM_MSTR.tsv", quote=F, sep="\t", col.names = NA)
+write.table(data.frame(merge(annot.gene, gene.dge$lcpm, by=0), row.names=1), 
+            file="processed/Gene_log2CPM_MSTR.tsv", quote=F, sep="\t", col.names = NA)
+
+```
+
+
+### Perform expression filtered normalization and export final data
+```{r}
+source("src/filterFPKM_v1.R")
+
+#Expression level for gene filtering
+exprlvl = 1
+
+## Clean up groups and meta sheet after merging technical replicates
+small_meta <- meta %>% filter(Tech_Rep==1)
+grp <- as.factor(small_meta$Glucose)
+
+
+#Filter data for those expressed
+filterFPKM(as.data.frame(gene.dge$counts), grp, exp = exprlvl)
+
+#Perform normalization for DE
+gene.dge.filt <- gene.dge[idx.filt, , keep.lib.sizes=FALSE]
+gene.dge.filt <- calcNormFactors(gene.dge.filt)
+gene.dge.filt$cpm <- cpm(gene.dge.filt, log=F)
+gene.dge.filt$lcpm <- log2(gene.dge.filt$cpm + 1)
+
+#Export the normalized filtered CPM values
+write.table(data.frame(merge(gene.dge.filt$genes, gene.dge.filt$cpm, by = 0), row.names = 1), 
+            file=paste0("processed/Gene_filtCPM_MSTR_", exprlvl, "CPM.tsv"), 
+            quote=F, sep="\t", col.names = NA)
+
+#Export the normalized filtered logCPM values
+write.table(data.frame(merge(gene.dge.filt$genes, gene.dge.filt$lcpm, by = 0), row.names = 1), 
+            file=paste0("processed/Gene_filtlog2CPM_MSTR_", exprlvl, "CPM.tsv"), 
+            quote=F, sep="\t", col.names = NA)
+
+print(paste0("Number of genes after filtering for ", exprlvl, " CPM: ", dim(gene.dge.filt)[1]))
+```
+
+
+### PCA
+```{r}
+library(PCAtools)
+
+rownames(small_meta) <- c(small_meta$Glucose_Rep)
+p <- pca(gene.dge.filt$lcpm, metadata = small_meta, removeVar = 0.1)
+
+## Variance per PC (Scree Plot)
+screeplot(p,
+          hline=75,
+          vline = 5)
+
+## PCA Plot
+biplot(p, 
+       colby = "Glucose")+
+  theme_classic()
+
+
+
+## Eigencor plot - Pearson's correlation of factor to PCs with FDR corrected p-value
+eigencorplot(p,
+             col = colorRampPalette(c("white", "red3"))(20),
+             components = getComponents(p, 1:5),
+             metavars = c('Glucose','Bio_Rep'),
+             plotRsquared = TRUE,
+             corFUN = 'pearson',
+             corUSE = 'pairwise.complete.obs',
+             corMultipleTestCorrection = 'fdr')
+```
+
+################################################################################
+### Differential Expression Analysis
+################################################################################
+
+### #Make the model matrix for analysis
+```{r}
+library(edgeR)
+
+# Set up ANOVA-like difference
+small_meta$Group <- as.factor(small_meta$Glucose)
+
+mod <- model.matrix(~0+small_meta$Group)
+colnames(mod) <- gsub("small_meta\\$", "", colnames(mod))
+colnames(mod) <- gsub("Group", "", colnames(mod))
+mod
+
+# Estimate dispersion
+gene.dge.filt <- estimateDisp(gene.dge.filt, mod)
+
+# Fit
+fit <- glmQLFit(gene.dge.filt, mod)
+colnames(fit)
+
+# Set desired individual contrasts
+conMatrix <- makeContrasts(
+  HighGlucose_v_LowGlucose = mM_25 - mM_5,
+  levels=mod)
+print("Matrix of examined contrasts")
+conMatrix
+
+
+```
+
+
+### Perform differential expression 
+```{r}
+
+# Set chromosome list
+chrList <- c(1:22,"Y","X")
+
+# Set thresholds
+library(dplyr)
+fc <- 1
+fdr <- 0.05
+
+   
+## Run Quasi-likelihood F Tests for all comparisons
+qlf <- glmQLFTest(fit, contrast = conMatrix[,"HighGlucose_v_LowGlucose"])
+
+## Store all genes 
+DE <- c()
+DE$HighGlucose_v_LowGlucose <- data.frame(topTags(qlf, n = Inf, p.value = 1, adjust.method = "BH", sort.by = "logFC")) %>% tibble::rownames_to_column("ensembl_ID")
+
+## Store sig genes
+DE$HighGlucose_v_LowGlucose <-data.frame(topTags(qlf, n = Inf, p.value = fdr, adjust.method = "BH", sort.by = "logFC")) %>% filter(abs(logFC) > fc) %>% filter(chromosome_name %in% chrList) %>% tibble::rownames_to_column("ensembl_ID")
+
+## Sig genes merged with CPM data
+cpm_table <- as.data.frame(gene.dge.filt$cpm)  %>% tibble::rownames_to_column("ensembl_ID")
+DE$HighGlucose_v_LowGlucose_sig_cpm <- DE$HighGlucose_v_LowGlucose %>% left_join(cpm_table)
+
+#Export Results
+write.csv(DE$HighGlucose_v_LowGlucose_sig_cpm, "processed/DEG_HighGlucose_v_LowGlucose.csv", row.names = TRUE)
+```
+
+################################################################################
+### Cluster Analysis and Functional Gene Enrichment
+################################################################################
+
+### Average the data and get Z-score
+```{r}
+source("src/MBave.R")
+
+
+# Get the average log2 CPM expression per group for plotting
+gene.dge$ave <- MBave(dat = gene.dge$lcpm, grp = grp)
+gene.dge$cpm_ave <- MBave(dat = gene.dge$cpm, grp = grp)
+```
+
+
+```{r}
+# Get the averaged Z-score for the DE sig genes
+gene.dge$aveZ <- t(scale(t(gene.dge$ave[DE$HighGlucose_v_LowGlucose_sig_cpm$ensembl_ID,]), center = T, scale = T))
+```
+
+
+```{r}
+library(gprofiler2)
+
+DE_Up <- DE$HighGlucose_v_LowGlucose_sig_cpm %>% filter(logFC>0)
+DE_Down <- DE$HighGlucose_v_LowGlucose_sig_cpm %>% filter(logFC<0)
+
+gostres_up <- gost(query = DE_Up$ensembl_ID, 
+                organism = "mmusculus", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = NULL, as_short_link = FALSE, highlight = TRUE)
+
+gostres_down <- gost(query = DE_Down$ensembl_ID, 
+                organism = "mmusculus", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = NULL, as_short_link = FALSE, highlight = TRUE)
+
+gostplot(gostres_up, capped = TRUE, interactive = TRUE)
+gostplot(gostres_down, capped = TRUE, interactive = TRUE)
+```
+
+
