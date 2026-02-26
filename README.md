@@ -5,11 +5,11 @@ This repository is associated with the manuscript, "Lactate and histone H3K18 la
 
 H3K18La CUT&Tag data for retina development timecourse (P4, P10, & P28) is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291664). 
 
-H3K18La CUT&Tag data for retina explant glucose and 2-DG experiments is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291663). The analysis code is available at R markdown files in the Explant directory.
+H3K18La CUT&Tag data for retina explant glucose and 2-DG experiments is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291663).
 
-H3K18La RNA-seq data for retina explant glucose experiment is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291663). The analysis code is available at R markdown files in the Explant directory.
+H3K18La RNA-seq data for retina explant glucose experiment is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291663). 
 
-H3K18La RNA-seq data for retina explant 2-DG experiment is available from NCBI's GEO database (). The analysis code is available at R markdown files in the Explant directory.
+H3K18La RNA-seq data for retina explant 2-DG experiment is available from NCBI's GEO database ().
 
 
 ### Scripts
