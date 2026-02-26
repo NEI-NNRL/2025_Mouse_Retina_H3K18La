@@ -921,7 +921,7 @@ cowplot::ggsave2(bp, filename = file.path(dir_export, paste0("05_Explant_DBvDGE_
                  height = 6, width = 6)
 
 
-
+write.table(dat2, file = "../data/processed/05_RNA-H3k18la.explant.db.results.tsv", row.names = F, sep = "\t", quote = F)
 
 
 

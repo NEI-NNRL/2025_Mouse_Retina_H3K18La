@@ -1,0 +1,966 @@
+---
+title: "H3K18la Impport & Analysis"
+output: html_notebook
+
+---
+
+
+**NOTES**: The data were generated from nf-core cutandrun pipeline.
+
+**UPDATE**: The definition of promoter (-1000 to +500) was used for peak annotation.
+            Filter the peaks for FDR of 10E-6 prior to generating the concensus peaks.
+
+
+
+### Get custom scripts and functions and outside data used for analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+script_dir <- "https://raw.githubusercontent.com/MBrooks313/R_codes/master"
+dest_tools_dir <- "../src/tools"
+dest_vis_dir <- "../src/visualization"
+
+download.file(url = file.path(script_dir, "GO_leaf.R"),
+              destfile = file.path(dest_tools_dir, "GO_leaf.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "DFave.R"),
+              destfile = file.path(dest_tools_dir, "DFave.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "Heatmap.R"),
+              destfile = file.path(dest_tools_dir, "Heatmap.R"),
+              method = "curl")
+
+library(tidyverse)
+options(java.parameters = "-Xmx8000m")
+print("Completed...")
+```
+
+### Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+
+ensDb <- ahdb[[1]]
+
+```
+
+################################################################################
+## Import outside data
+################################################################################
+```{r}
+source("../src/tools/DFave.R")
+
+#############################################
+# Import expression data for flow-sorted rods
+fsprwt.dwnld <- read.csv("../data/external/Mouse_FSPR_WT_Development_Gene_nCPM_ENSv98.tsv",
+                         sep = "\t", row.names = 1)
+# Get group info for averaging
+grp <- gsub("(.+)\\.FS.+", "\\1", colnames(fsprwt.dwnld)[10:25])
+exp_grp <- factor(grp, levels = unique(grp))
+
+# Get average CPM values
+fsprwt_cpm <- data.frame(merge(fsprwt.dwnld[,1:9],
+                               log2(DFave(fsprwt.dwnld[,10:25], exp_grp) + 1),
+                               by = 0),
+                         row.names = 1)
+
+fsprwt_z <- data.frame(merge(fsprwt_cpm[,1:9],
+                               t(scale(t(fsprwt_cpm[,10:15]), scale = T, center = T)),
+                               by = 0),
+                         row.names = 1)
+
+
+
+#############################################
+# Import expression data for developing retina
+retina.dwnld <- read.csv("../data/external/Mouse_Retina_Development_Gene_nCPM_ENSv98.tsv",
+                         sep = "\t", row.names = 1)
+
+# Get group info for averaging
+grp <- gsub("(.+)\\.Retina.+", "\\1", colnames(retina.dwnld)[10:31])
+exp_grp <- factor(grp, levels = unique(grp))
+
+# Get average CPM values
+retina_cpm <- data.frame(merge(retina.dwnld[,1:9],
+                               log2(DFave(retina.dwnld[,10:31], exp_grp) + 1),
+                               by = 0),
+                         row.names = 1)
+
+retina_z <- data.frame(merge(retina_cpm[,1:9],
+                               t(scale(t(retina_cpm[,10:19]), scale = T, center = T)),
+                               by = 0),
+                         row.names = 1)
+
+
+
+#############################################
+# Import the ChromHMM from Aldiri data
+chromhmm_beds <- list.files(path = "/Volumes/data-1/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/chromhmm", pattern = "*bed", recursive = T, full.names = T)
+names(chromhmm_beds) <- gsub(".+\\/(.+)_16.+", "\\1", chromhmm_beds)
+
+# Import the beds 
+chromHMM <- sapply(chromhmm_beds, toGRanges, format="BED", skip=1)
+
+# Add the HMM calls to the rows
+for (i in 1:length(chromhmm_beds)){
+  mcols(chromHMM[[i]])$HMM <- read.table(chromhmm_beds[i], skip = 1)[,4]
+  seqlevelsStyle(chromHMM[[i]]) <- "NCBI"
+}
+
+
+
+#############################################
+# Import the ATAC-seq from Aldiri
+atac_beds <- list.files(path = "/Volumes/data-1/NGS/ATAC-seq/ENCODE_v1_9_0/Mouse/Aldiri_GSE102092/bed", pattern = "*narrowPeak.gz", recursive = T, full.names = T)
+names(atac_beds) <- gsub(".+\\/(.+)_idr.+", "\\1", atac_beds)
+
+# Import the beds 
+atac <- sapply(atac_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(atac)){
+  atac[[i]] <- reduce(atac[[i]])
+  seqlevelsStyle(atac[[i]]) <- "NCBI"
+}
+
+
+
+#############################################
+# Import the H3K27ac from Aldiri
+k27_aldiri_beds <- list.files(path = "/Volumes/data-1/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bed/", pattern = "*H3K27Ac*", recursive = T, full.names = T)
+names(k27_aldiri_beds) <- gsub(".+\\/(.+)_H3K27.+", "\\1", k27_aldiri_beds)
+
+# Import the beds 
+k27_aldiri <- sapply(k27_aldiri_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(k27_aldiri)){
+  k27_aldiri[[i]] <- GenomicRanges::reduce(k27_aldiri[[i]])
+  seqlevelsStyle(k27_aldiri[[i]]) <- "NCBI"
+}
+
+
+#############################################
+# Import the H3K4me3 from Aldiri
+k4me3_aldiri_beds <- list.files(path = "/Volumes/data-1/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bed/", pattern = "*H3K4me3_*", recursive = T, full.names = T)
+names(k4me3_aldiri_beds) <- gsub(".+\\/(.+)_H3K4me3.+", "\\1", k4me3_aldiri_beds)
+
+# Import the beds 
+k4me3_aldiri <- sapply(k4me3_aldiri_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(k4me3_aldiri)){
+  k4me3_aldiri[[i]] <- GenomicRanges::reduce(k4me3_aldiri[[i]])
+  seqlevelsStyle(k4me3_aldiri[[i]]) <- "NCBI"
+}
+
+
+
+#############################################
+# Import the Nrl peaks from Liang
+nrl_beds <- list.files(path = "/Volumes/data-1/People/brooksma/PEGASUS/Projects/Xulong/CutNRun/Mouse/Analysis/20200309_16-29/200723/data/interim/beds/idr", pattern = "Nrl.+idr05.+narrowPeak", recursive = F, full.names = T)
+names(nrl_beds) <- gsub(".+\\/Nrl_(.+)\\.Rep.+", "\\1", nrl_beds)
+
+# Import the beds 
+nrl <- sapply(nrl_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(nrl)){
+  seqlevelsStyle(nrl[[i]]) <- "NCBI"
+}
+
+
+```
+
+
+### Annotate outside data
+```{r}
+
+# Aldiri k27ac 
+k27AnnoList_ens <- list()
+
+for (i in 1:length(k27_aldiri)){
+  
+  peak_tmp <- k27_aldiri[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+  
+  k27AnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(k27AnnoList_ens) <- names(k27_aldiri)
+
+
+# Aldiri k4me3 
+k4me3AnnoList_ens <- list()
+
+for (i in 1:length(k4me3_aldiri)){
+  
+  peak_tmp <- k4me3_aldiri[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+  
+  k4me3AnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(k4me3AnnoList_ens) <- names(k4me3_aldiri)
+
+
+```
+
+
+################################################################################
+## Timecourse H3K18la samples
+################################################################################
+
+### Get metadata for samples
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+
+# Macs2 beds from NF-core
+macs_beds <- list.files(path = "../data/interim/bed/macs2/", pattern = "narrowPeak", recursive = T)
+
+# Meta sheet
+meta <- data.frame(Beds = macs_beds[1:7],
+                   Samp = gsub("H3K18La_(P.+)\\.macs.+", "\\1", macs_beds[1:7]),
+                   Group = gsub("H3K18La_(P\\d+)_R.+", "\\1", macs_beds[1:7]))
+
+meta <- meta[c(6,7,1:5),]
+
+meta$Samp <- factor(meta$Samp, levels = unique(meta$Samp))
+meta$Group <- factor(meta$Group, levels = unique(meta$Group))
+
+```
+
+
+### Import the peaks into a merged list object and plot for number of peaks at each timepoint
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(ChIPpeakAnno)
+
+macs_dir <- "../data/interim/bed/macs2/"
+
+# Import the cons peaks
+peakList <- sapply(file.path(macs_dir, meta$Beds), toGRanges, format="narrowPeak")
+names(peakList) <- meta$Samp
+
+peakList_1E6 <- GRangesList()
+# Sort the cons peaks
+for (i in 1:length(peakList)){
+  
+  # seqlevelsStyle(peakList[[i]]) <- "NCBI"
+  tmp_peak <- sortSeqlevels(peakList[[i]])
+  tmp_peak <- GenomicRanges::sort(tmp_peak)
+  tmp_peak <- tmp_peak[(elementMetadata(tmp_peak)[,"qValue"] > 6) & (seqnames(tmp_peak) != "MT")]
+  peakList_1E6[[i]] <- tmp_peak
+}
+names(peakList_1E6) <- meta$Samp
+
+# Gen consensus peaks from each timepoint
+ol_P4 <- findOverlapsOfPeaks(c(peakList_1E6[1],
+                             peakList_1E6[2]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_P10 <- findOverlapsOfPeaks(c(peakList_1E6[3],
+                             peakList_1E6[4]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_P28 <- findOverlapsOfPeaks(c(peakList_1E6[5],
+                             peakList_1E6[6],
+                             peakList_1E6[7]), connectedPeaks="keepAll", ignore.strand = T)
+
+peakList_cons <- GRangesList(ol_P4$mergedPeaks, ol_P10$mergedPeaks, ol_P28$mergedPeaks)
+names(peakList_cons) <- c("P4", "P10", "P28")
+
+```
+
+
+### Annotate peaks with ensembl db
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(ChIPseeker)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(GenomicFeatures)
+
+
+peakAnnoList_ens <- list()
+
+for (i in 1:length(peakList_cons)){
+  
+  peak_tmp <- peakList_cons[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+  peakAnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(peakAnnoList_ens) <- names(peakList_cons)
+
+```
+
+
+### Evaluate location of peaks relative to annotation features - Figure 3
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+
+
+#######################
+# Consensus peak number
+#######################
+
+# Generate plot for peak number
+df <- lapply(peakList_cons, length) %>% as.data.frame() %>% gather("Sample", "Peaks")
+df$Sample <- gsub("K18La\\.", "", df$Sample)
+df$Sample <- gsub("X", "", df$Sample)
+df$Sample <- factor(df$Sample, levels = df$Sample)
+
+uniq_genes <- lapply(peakAnnoList_ens, function(x){x@anno$SYMBOL %>% unique() %>% length()}) %>% unlist() %>% as.vector()
+prom_genes <- lapply(peakAnnoList_ens, function(x){x@anno %>% 
+    as.data.frame() %>% 
+    dplyr::filter(annotation == "Promoter") %>% 
+    dplyr::select(SYMBOL) %>% 
+    as.vector() %>% unlist() %>% 
+    unique() %>% length()}) %>% 
+  unlist() %>% as.vector()
+
+b <- ggplot(df, aes(Sample, Peaks))+
+  geom_bar(stat = "identity", fill = "grey50") +
+  geom_point(aes(x = c(1:3), y = uniq_genes), colour = "red", size = 2) +
+  annotate("text", x = c(1:3), y = uniq_genes + 200, label = uniq_genes) +
+  geom_point(aes(x = c(1:3), y = prom_genes), colour = "blue", size = 2) +
+  annotate("text", x = c(1:3), y = prom_genes + 200, label = prom_genes) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 0.8, vjust = 0.8)) +
+  labs(title = "Peaks") + xlab(NULL)
+
+cowplot::ggsave2(plot = b, filename = "../data/processed/01_Peak_number_TP.pdf", height = 3, width = 2.5)
+
+
+#######################
+# Consensus peak evaluation
+#######################
+
+promoter <- getPromoters(TxDb = ensDb, upstream = 3000, downstream = 3000)
+seqlevelsStyle(promoter) <- "NCBI"
+
+tagMatrixList <- list()
+for (i in names(peakList_cons)){
+  tagMatrixList[[i]] <- getTagMatrix(peakList_cons[[i]], windows=promoter)
+}
+
+
+# Plot peak histogram around TSS
+p <- plotAvgProf(tagMatrixList, xlim=c(-3000, 3000), resmple = 100,
+            xlab="Genomic Region (5'->3')", ylab = "Read Count Frequency")
+print(p)
+
+pdf("../data/processed/01_Peak_TSS_hist_allPeaks.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+# Plot annotation bargraph
+p <- plotAnnoBar(peakAnnoList_ens, title = "H3K18la peak annotation")
+print(p)
+
+pdf("../data/processed/01_Peak_annot_bar_allPeaks.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+# Plot disrtobution of peaks realtive to TSS
+p <- plotDistToTSS(peakAnnoList_ens,
+              title="Distribution of H3K18la peak to TSS")
+print(p)
+
+pdf("../data/processed/01_Peak_TSSdist_bar_allPeaks.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+```
+
+
+### FunctionalGeneEnrichment - Figure S1
+```{r}
+
+library(clusterProfiler)
+library(enrichplot)
+library(org.Mm.eg.db)
+source(file.path(dest_tools_dir, "GO_leaf.R"))
+# source("../src/tools/Dotplot_GO.R")
+
+org = "org.Mm.eg.db"
+
+enrich_db <- "GO_220310"
+GOont <- "BP"
+top <- 5
+
+# dir_enrich <- file.path(dir_res, "FuncGeneEnrich")
+dir_enrich <- file.path(dir_export, paste0("01_FuncGeneEnrich_", enrich_db, "_", GOont))
+dir.create(dir_enrich)
+
+
+
+# Get subsets of annotation to run FGE based on last mtg's discussion
+prom_list <- lapply(peakAnnoList_ens, function(x){x@anno[x@anno$annotation == "Promoter" & 
+                                                           x@anno$transcriptBiotype == "protein_coding"]})
+
+genebody_list <- lapply(peakAnnoList_ens, function(x){x@anno[!(x@anno$annotation %in% c("Promoter", "Downstream", "Distal Intergenic")) & 
+                                                           x@anno$transcriptBiotype == "protein_coding"]})
+
+enhancer_list <- lapply(peakAnnoList_ens, function(x){x@anno[x@anno$distanceToTSS > -10000 & 
+                                                               x@anno$distanceToTSS < -1000 & 
+                                                           x@anno$transcriptBiotype == "protein_coding"]})
+
+# Get list of genes associated with the peaks for each subgroup
+prom_gene_list <- lapply(prom_list, function(x){x@elementMetadata$SYMBOL %>% unique() %>% unlist() %>% as.vector()}) 
+
+genebody_gene_list <- lapply(genebody_list, function(x){x@elementMetadata$SYMBOL %>% unique() %>% unlist() %>% as.vector()}) 
+
+enhancer_gene_list <- lapply(enhancer_list, function(x){x@elementMetadata$SYMBOL %>% unique() %>% unlist() %>% as.vector()}) 
+
+
+# Prep the gene lists for the FGE loop
+goi_list <- list(prom_gene_list, genebody_gene_list, enhancer_gene_list)
+names(goi_list) <- c("Promoter", "Genebody", "Enhancer")
+
+# Perform FGE on the GOIs from each subset of peaks
+for (i in names(goi_list)){
+  
+  enrich_results <- clusterProfiler::compareCluster(geneClusters = goi_list[[i]], fun = "enrichGO",
+                                            keyType = "SYMBOL", ont = GOont, OrgDb = org)
+  
+  
+  # Filter enrichment for significance
+  enrich_results_filt <- enrich_results@compareClusterResult %>% dplyr::filter(p.adjust < 0.05, Count > 3)
+  
+  # Fix the Ratio
+  enrich_results_filt_fix <- enrich_results_filt %>% 
+    as.data.frame() %>% 
+    mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+    rowwise() %>% 
+    mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+  
+  # Export the FGE results table
+  tmp <- enrich_results_filt_fix[,-11]
+  # Export the enrichment analysis
+  write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_", i, "_full.tsv")),
+                quote = F, row.names = F, sep = "\t")
+
+  # Get leaf terms
+  enrich_results_leaf <- GO_leaf(enrich_results_filt, query = 1, id.col = 2, ont = GOont)
+  
+  # Fix the Ratio
+  enrich_results_leaf_fix <- enrich_results_leaf %>% 
+    as.data.frame() %>% 
+    mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+    rowwise() %>% 
+    mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+  
+  # Export the FGE results table
+  tmp <- enrich_results_leaf_fix[,-11]
+  # Export the enrichment analysis
+  write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_", i, "_leaf.tsv")),
+                quote = F, row.names = F, sep = "\t")
+  
+  # Get top 5 pathways per cell type to get union set of pathways
+  top5_union <- enrich_results_leaf %>% 
+    group_by(Cluster) %>% 
+    arrange(p.adjust) %>% 
+    slice_head(n = top)
+  
+  
+  # Filter the full table for the union of top5 pathways
+  top5_enrich <- enrich_results_filt_fix %>% 
+    dplyr::filter(ID %in% (top5_union$ID %>% unique()))
+  
+  # Prep the df for plotting
+  top5_enrich <- top5_enrich %>% 
+    arrange(Cluster, p.adjust)
+  top5_enrich$Description <- substring(top5_enrich$Description, 1, 60)
+  top5_enrich$Description <- factor(top5_enrich$Description, levels = rev(unique(top5_enrich$Description)))
+  top5_enrich$p.adjust <- -log10(top5_enrich$p.adjust)
+  
+  # Make plot
+  pp <- ggplot(top5_enrich, aes(Cluster, Description, colour = p.adjust)) + 
+      geom_point(aes(size = Ratio)) + 
+      theme_bw() +
+      scale_colour_gradient(low = "#3B9AB2", high = "#F21A00", name = "P Value\n-log10", limits=c(0,10), oob = scales::squish) +
+      guides(size=guide_legend(title="Ratio")) +
+      theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+            axis.text.x = element_text(angle = 30, hjust = 1)) +
+      ggtitle(paste0("H3K18la Peaks in ", i))
+  
+  #Open the pdf device
+  cowplot::ggsave2(plot = pp, filename = file.path(dir_enrich, paste0("Timepoint_FGE_top_", top, "_", i, "_leaf_01_dotplot.pdf")),
+                   height = top5_enrich$Description %>% unique() %>% length() / 10 + 2.5, 
+                   width = 6)
+    
+}
+
+```
+
+
+################################################################################
+## Correlate H3K18La peaks with ATAC, ChromHMM, NRL peaks - Figure 3 and S2
+################################################################################
+```{r}
+
+########################
+# Promoter peak overlaps
+
+###########
+# Nrl peaks 
+nrl_ol_p4 <- findOverlapsOfPeaks(prom_list$`P4`, nrl$P4, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p10 <- findOverlapsOfPeaks(prom_list$`P10`, nrl$P10, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p28 <- findOverlapsOfPeaks(prom_list$`P28`, nrl$P28, connectedPeaks = "keepAll", maxgap = 500L)
+
+nrl_df <- cbind(lapply(nrl_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Nrl = rep(c("Nrl", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Nrl != "Nrl")
+colnames(nrl_df)[1] <- "Count"
+
+nrl_df$Age <- factor(nrl_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+nb <- ggplot(nrl_df, aes(x = Age, y = Count, fill = Nrl)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Promoter Peak Overlap with Nrl")
+
+cowplot::ggsave2(nb, filename = file.path(dir_export, paste0("01_Prom_H3K18la-NRL_OL.pdf")),
+                 height = 2, width = 4)
+
+############
+# ATAC peaks 
+atac_ol_p4 <- findOverlapsOfPeaks(prom_list$`P4`, atac$P3, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p10 <- findOverlapsOfPeaks(prom_list$`P10`, atac$P10, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p28 <- findOverlapsOfPeaks(prom_list$`P28`, atac$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+atac_df <- cbind(lapply(atac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Atac = rep(c("ATAC", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Atac != "ATAC")
+colnames(atac_df)[1] <- "Count"
+
+atac_df$Age <- factor(atac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(atac_df, aes(x = Age, y = Count, fill = Atac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Promoter Peak Overlap with ATAC")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_Prom_H3K18la-ATAC_OL.pdf")),
+                 height = 2, width = 4)
+
+
+############
+# k27ac peaks Aldiri
+k27ac_ol_p4 <- findOverlapsOfPeaks(prom_list$`P4`, k27_aldiri$P3, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p10 <- findOverlapsOfPeaks(prom_list$`P10`, k27_aldiri$P10, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p28 <- findOverlapsOfPeaks(prom_list$`P28`, k27_aldiri$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+k27ac_df <- cbind(lapply(k27ac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         k27ac = rep(c("k27ac", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(k27ac != "k27ac")
+colnames(k27ac_df)[1] <- "Count"
+
+k27ac_df$Age <- factor(k27ac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(k27ac_df, aes(x = Age, y = Count, fill = k27ac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Promoter Peak Overlap with H3K27ac")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_Prom_H3K18la-k27ac_aldiri_OL.pdf")),
+                 height = 2, width = 4)
+
+
+##########
+# ChromHMM
+chromHMM_ol_p4 <- findOverlapsOfPeaks(prom_list$`P4`, chromHMM$P3, connectedPeaks = "keepAll")
+chromHMM_ol_p10 <- findOverlapsOfPeaks(prom_list$`P10`, chromHMM$P10, connectedPeaks = "keepAll")
+chromHMM_ol_p28 <- findOverlapsOfPeaks(prom_list$`P28`, chromHMM$P21, connectedPeaks = "keepAll")
+
+chromHMM_ol_p4_fix <- chromHMM_ol_p4$overlappingPeaks$`prom_list.P4///chromHMM.P3` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p10_fix <- chromHMM_ol_p10$overlappingPeaks$`prom_list.P10///chromHMM.P10` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p28_fix <- chromHMM_ol_p28$overlappingPeaks$`prom_list.P28///chromHMM.P21` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromhmm_df <- rbind(chromHMM_ol_p4_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P4"),
+                     chromHMM_ol_p10_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P10"),
+                     chromHMM_ol_p28_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P28"))
+colnames(chromhmm_df)[1] <- "HMM"
+
+chromhmm_df$HMM <- factor(chromhmm_df$HMM, levels = seq(16,1))
+chromhmm_df$Age <- factor(chromhmm_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- RColorBrewer::brewer.pal(6, "Accent")
+
+col_fill <- colorRampPalette(col_pal)(16)
+
+cb <- ggplot(chromhmm_df, aes(x = Age, y = Freq, fill = HMM)) +
+  geom_bar(position="fill", stat="identity") +
+  viridis::scale_fill_viridis(discrete = T, option = "H", direction = 1, guide = guide_legend(reverse = TRUE)) +
+  coord_flip() +
+  labs(title = "H3K18la Promoter Peak Overlap with ChromHMM")
+
+cowplot::ggsave2(cb, filename = file.path(dir_export, paste0("01_Prom_H3K18la-ChromHMM_OL.pdf")),
+                 height = 2, width = 4)
+
+
+
+
+########################
+# Enhancer peak overlaps
+
+###########
+# Nrl peaks 
+nrl_ol_p4 <- findOverlapsOfPeaks(enhancer_list$`P4`, nrl$P4, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p10 <- findOverlapsOfPeaks(enhancer_list$`P10`, nrl$P10, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p28 <- findOverlapsOfPeaks(enhancer_list$`P28`, nrl$P28, connectedPeaks = "keepAll", maxgap = 500L)
+
+nrl_df <- cbind(lapply(nrl_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Nrl = rep(c("Nrl", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Nrl != "Nrl")
+colnames(nrl_df)[1] <- "Count"
+
+nrl_df$Age <- factor(nrl_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+nb <- ggplot(nrl_df, aes(x = Age, y = Count, fill = Nrl)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Enhancer Peak Overlap with Nrl")
+
+cowplot::ggsave2(nb, filename = file.path(dir_export, paste0("01_Enhancer_H3NRL_OL.pdf")),
+                 height = 2, width = 4)
+
+############
+# ATAC peaks 
+atac_ol_p4 <- findOverlapsOfPeaks(enhancer_list$`P4`, atac$P3, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p10 <- findOverlapsOfPeaks(enhancer_list$`P10`, atac$P10, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p28 <- findOverlapsOfPeaks(enhancer_list$`P28`, atac$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+atac_df <- cbind(lapply(atac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Atac = rep(c("ATAC", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Atac != "ATAC")
+colnames(atac_df)[1] <- "Count"
+
+atac_df$Age <- factor(atac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(atac_df, aes(x = Age, y = Count, fill = Atac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Enhancer Peak Overlap with ATAC")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_Enhancer_H3ATAC_OL.pdf")),
+                 height = 2, width = 4)
+
+
+############
+# k27ac peaks Aldiri
+k27ac_ol_p4 <- findOverlapsOfPeaks(enhancer_list$`P4`, k27_aldiri$P3, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p10 <- findOverlapsOfPeaks(enhancer_list$`P10`, k27_aldiri$P10, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p28 <- findOverlapsOfPeaks(enhancer_list$`P28`, k27_aldiri$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+k27ac_df <- cbind(lapply(k27ac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         k27ac = rep(c("k27ac", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(k27ac != "k27ac")
+colnames(k27ac_df)[1] <- "Count"
+
+k27ac_df$Age <- factor(k27ac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+# col_pal <- RColorBrewer::brewer.pal(6, "Accent")
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(k27ac_df, aes(x = Age, y = Count, fill = k27ac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Enhancer Peak Overlap with H3K27ac")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_Enhancer_H3k27ac_aldiri_OL.pdf")),
+                 height = 2, width = 4)
+
+
+##########
+# ChromHMM
+chromHMM_ol_p4 <- findOverlapsOfPeaks(enhancer_list$`P4`, chromHMM$P3, connectedPeaks = "keepAll")
+chromHMM_ol_p10 <- findOverlapsOfPeaks(enhancer_list$`P10`, chromHMM$P10, connectedPeaks = "keepAll")
+chromHMM_ol_p28 <- findOverlapsOfPeaks(enhancer_list$`P28`, chromHMM$P21, connectedPeaks = "keepAll")
+
+chromHMM_ol_p4_fix <- chromHMM_ol_p4$overlappingPeaks$`enhancer_list.P4///chromHMM.P3` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p10_fix <- chromHMM_ol_p10$overlappingPeaks$`enhancer_list.P10///chromHMM.P10` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p28_fix <- chromHMM_ol_p28$overlappingPeaks$`enhancer_list.P28///chromHMM.P21` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromhmm_df <- rbind(chromHMM_ol_p4_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P4"),
+                     chromHMM_ol_p10_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P10"),
+                     chromHMM_ol_p28_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P28"))
+colnames(chromhmm_df)[1] <- "HMM"
+
+chromhmm_df$HMM <- factor(chromhmm_df$HMM, levels = seq(16,1))
+chromhmm_df$Age <- factor(chromhmm_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- RColorBrewer::brewer.pal(6, "Accent")
+
+col_fill <- colorRampPalette(col_pal)(16)
+
+cb <- ggplot(chromhmm_df, aes(x = Age, y = Freq, fill = HMM)) +
+  geom_bar(position="fill", stat="identity") +
+  viridis::scale_fill_viridis(discrete = T, option = "H", direction = 1, guide = guide_legend(reverse = TRUE)) +
+  coord_flip() +
+  labs(title = "H3K18la Enhancer Peak Overlap with ChromHMM")
+
+cowplot::ggsave2(cb, filename = file.path(dir_export, paste0("01_Enhancer_H3ChromHMM_OL.pdf")),
+                 height = 2, width = 4)
+
+
+
+
+########################
+# Genebody peak overlaps
+
+###########
+# Nrl peaks 
+nrl_ol_p4 <- findOverlapsOfPeaks(genebody_list$`P4`, nrl$P4, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p10 <- findOverlapsOfPeaks(genebody_list$`P10`, nrl$P10, connectedPeaks = "keepAll", maxgap = 500L)
+nrl_ol_p28 <- findOverlapsOfPeaks(genebody_list$`P28`, nrl$P28, connectedPeaks = "keepAll", maxgap = 500L)
+
+nrl_df <- cbind(lapply(nrl_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(nrl_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Nrl = rep(c("Nrl", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Nrl != "Nrl")
+colnames(nrl_df)[1] <- "Count"
+
+nrl_df$Age <- factor(nrl_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+nb <- ggplot(nrl_df, aes(x = Age, y = Count, fill = Nrl)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Genebody Peak Overlap with Nrl")
+
+cowplot::ggsave2(nb, filename = file.path(dir_export, paste0("01_GeneBody_H3NRL_OL.pdf")),
+                 height = 2, width = 4)
+
+############
+# ATAC peaks 
+atac_ol_p4 <- findOverlapsOfPeaks(genebody_list$`P4`, atac$P3, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p10 <- findOverlapsOfPeaks(genebody_list$`P10`, atac$P10, connectedPeaks = "keepAll", maxgap = 500L)
+atac_ol_p28 <- findOverlapsOfPeaks(genebody_list$`P28`, atac$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+atac_df <- cbind(lapply(atac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(atac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         Atac = rep(c("ATAC", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(Atac != "ATAC")
+colnames(atac_df)[1] <- "Count"
+
+atac_df$Age <- factor(atac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(atac_df, aes(x = Age, y = Count, fill = Atac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Genebody Peak Overlap with ATAC")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_GeneBody_H3ATAC_OL.pdf")),
+                 height = 2, width = 4)
+
+
+############
+# k27ac peaks Aldiri
+k27ac_ol_p4 <- findOverlapsOfPeaks(genebody_list$`P4`, k27_aldiri$P3, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p10 <- findOverlapsOfPeaks(genebody_list$`P10`, k27_aldiri$P10, connectedPeaks = "keepAll", maxgap = 500L)
+k27ac_ol_p28 <- findOverlapsOfPeaks(genebody_list$`P28`, k27_aldiri$P21, connectedPeaks = "keepAll", maxgap = 500L)
+
+
+k27ac_df <- cbind(lapply(k27ac_ol_p4$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p10$peaklist, length) %>% as.data.frame(),
+                 lapply(k27ac_ol_p28$peaklist, length) %>% as.data.frame()) %>% t() %>% 
+  as.data.frame() %>% 
+  mutate(Age = rep(c("P4", "P10", "P28"), each = 3),
+         k27ac = rep(c("k27ac", "non-OL", "OL"), 3)) %>% 
+  dplyr::filter(k27ac != "k27ac")
+colnames(k27ac_df)[1] <- "Count"
+
+k27ac_df$Age <- factor(k27ac_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- wesanderson::wes_palette("Zissou1", 5, "discrete")
+col_fill <- colorRampPalette(col_pal)(2)
+
+ab <- ggplot(k27ac_df, aes(x = Age, y = Count, fill = k27ac)) +
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(values = rev(col_fill)) +
+  coord_flip() +
+  labs(title = "H3K18la Genebody Peak Overlap with H3K27ac")
+
+cowplot::ggsave2(ab, filename = file.path(dir_export, paste0("01_GeneBody_H3k27ac_aldiri_OL.pdf")),
+                 height = 2, width = 4)
+
+##########
+# ChromHMM
+chromHMM_ol_p4 <- findOverlapsOfPeaks(genebody_list$`P4`, chromHMM$P3, connectedPeaks = "keepAll")
+chromHMM_ol_p10 <- findOverlapsOfPeaks(genebody_list$`P10`, chromHMM$P10, connectedPeaks = "keepAll")
+chromHMM_ol_p28 <- findOverlapsOfPeaks(genebody_list$`P28`, chromHMM$P21, connectedPeaks = "keepAll")
+
+chromHMM_ol_p4_fix <- chromHMM_ol_p4$overlappingPeaks$`genebody_list.P4///chromHMM.P3` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p10_fix <- chromHMM_ol_p10$overlappingPeaks$`genebody_list.P10///chromHMM.P10` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromHMM_ol_p28_fix <- chromHMM_ol_p28$overlappingPeaks$`genebody_list.P28///chromHMM.P21` %>% 
+  rownames_to_column(var = "peakMerge") %>% 
+  dplyr::select(peakMerge, peaks1, peaks2, HMM, shortestDistance) %>% 
+  group_by(peaks1) %>% 
+  slice_max(shortestDistance)
+
+chromhmm_df <- rbind(chromHMM_ol_p4_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P4"),
+                     chromHMM_ol_p10_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P10"),
+                     chromHMM_ol_p28_fix$HMM %>% table() %>% as.data.frame() %>% mutate(Age = "P28"))
+colnames(chromhmm_df)[1] <- "HMM"
+
+chromhmm_df$HMM <- factor(chromhmm_df$HMM, levels = seq(16,1))
+chromhmm_df$Age <- factor(chromhmm_df$Age, levels = rev(c("P4", "P10", "P28")))
+
+col_pal <- RColorBrewer::brewer.pal(6, "Accent")
+
+col_fill <- colorRampPalette(col_pal)(16)
+
+cb <- ggplot(chromhmm_df, aes(x = Age, y = Freq, fill = HMM)) +
+  geom_bar(position="fill", stat="identity") +
+  viridis::scale_fill_viridis(discrete = T, option = "H", direction = 1, guide = guide_legend(reverse = TRUE)) +
+  coord_flip() +
+  labs(title = "H3K18la Genebody Peak Overlap with ChromHMM")
+
+cowplot::ggsave2(cb, filename = file.path(dir_export, paste0("01_GeneBody_H3ChromHMM_OL.pdf")),
+                 height = 2, width = 4)
+
+
+```
+
+
+### Export the annotated peak file
+```{r}
+
+saveRDS(peakList_cons, file = "../data/interim/peakList_cons_240911.RDS")
+saveRDS(peakAnnoList_ens, file = "../data/interim/peakAnnoList_cons_240911.RDS")
+
+```
+

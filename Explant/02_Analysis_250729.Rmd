@@ -114,9 +114,9 @@ library(biomaRt)
 library(GenomicFeatures)
 
 
-peakList_cons <- readRDS(file = "../data/interim/peakList_cons_240911.RDS")
+peakList_cons <- readRDS(file = "../data/interim/peakList_cons_250729.RDS")
 # peakList_cons <- peakList_cons[c(1:3)]
-peakAnnoList_ens <- readRDS(file = "../data/interim/peakAnnoList_cons_240911.RDS")
+peakAnnoList_ens <- readRDS(file = "../data/interim/peakAnnoList_cons_250729.RDS")
 # peakAnnoList_ens <- peakAnnoList_ens[c(1:3)]
 
 ## Annotate peaks with ensembl db
@@ -375,10 +375,10 @@ prom_genes <- lapply(peakAnnoList_ens, function(x){x@anno %>%
 
 b <- ggplot(df, aes(Sample, Peaks))+
   geom_bar(stat = "identity", fill = "grey50") +
-  geom_point(aes(x = c(1:3), y = uniq_genes), colour = "red", size = 2) +
-  annotate("text", x = c(1:3), y = uniq_genes + 200, label = uniq_genes) +
-  geom_point(aes(x = c(1:3), y = prom_genes), colour = "blue", size = 2) +
-  annotate("text", x = c(1:3), y = prom_genes + 200, label = prom_genes) +
+  geom_point(aes(x = c(1:6), y = uniq_genes), colour = "red", size = 2) +
+  annotate("text", x = c(1:6), y = uniq_genes + 200, label = uniq_genes) +
+  geom_point(aes(x = c(1:6), y = prom_genes), colour = "blue", size = 2) +
+  annotate("text", x = c(1:6), y = prom_genes + 200, label = prom_genes) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 30, hjust = 0.8, vjust = 0.8)) +
   labs(title = "Peaks") + xlab(NULL)
@@ -485,7 +485,7 @@ GOont <- "BP"
 top <- 5
 
 # dir_enrich <- file.path(dir_res, "FuncGeneEnrich")
-dir_enrich <- file.path(dir_export, paste0("03_FuncGeneEnrich_", enrich_db, "_", GOont))
+dir_enrich <- file.path(dir_export, paste0("02_FuncGeneEnrich_", enrich_db, "_", GOont))
 dir.create(dir_enrich)
 
 
@@ -592,14 +592,14 @@ for (i in names(goi_list)){
 region_df <- data.frame(Count = c(lapply(enhancer_list, length),
                           lapply(prom_list, length),
                           lapply(genebody_list, length)) %>% unlist() %>% as.vector(),
-                         Region = rep(c("Enhancer", "Promoter", "Genebody"), each = 3),
-                         Age = rep(c("P4", "P10", "P28"), 3))
+                         Region = rep(c("Enhancer", "Promoter", "Genebody"), each = 6),
+                         Group = rep(c(names(enhancer_list)), 3))
 
 
-region_df$Age <- factor(region_df$Age, levels = c("P4", "P10", "P28"))
+region_df$Group <- factor(region_df$Group, levels = names(enhancer_list))
 region_df$Region <- factor(region_df$Region, levels = rev(c("Genebody", "Enhancer", "Promoter")))
 
-rb <- ggplot(region_df, aes(x = Age, y = Count, fill = Region)) +
+rb <- ggplot(region_df, aes(x = Group, y = Count, fill = Region)) +
   geom_bar(position="fill", stat="identity") + 
   # scale_fill_manual(values = rev(col_fill)) +
   labs(title = "H3K18la Peak Annotation Region with Age")

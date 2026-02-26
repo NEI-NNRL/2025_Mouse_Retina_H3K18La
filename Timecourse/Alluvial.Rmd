@@ -1,0 +1,843 @@
+---
+title: "H3K18la Alluvial Analysis"
+output: html_notebook
+
+---
+
+### Get custom scripts and functions and outside data used for analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+script_dir <- "https://raw.githubusercontent.com/MBrooks313/R_codes/master"
+dest_tools_dir <- "../src/tools"
+dest_vis_dir <- "../src/visualization"
+
+download.file(url = file.path(script_dir, "DFave.R"),
+              destfile = file.path(dest_tools_dir, "DFave.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "Expr_Filter.R"),
+              destfile = file.path(dest_tools_dir, "Expr_Filter.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "Barplot_GO.R"),
+              destfile = file.path(dest_tools_dir, "Barplot_GO.R"),
+              method = "curl")
+
+
+library(tidyverse)
+
+```
+
+
+### Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+## Query for all available EnsDb databases
+ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+
+ensDb <- ahdb[[1]]
+
+```
+
+
+################################################################################
+### Import outside datasets
+################################################################################
+```{r}
+
+source(file.path(dest_tools_dir, "DFave.R"))
+
+#############################################
+# Import expression data for developing retina
+retina.dwnld <- read.csv("../data/external/Mouse_Retina_Development_Gene_nCPM_ENSv98.tsv",
+                         sep = "\t", row.names = 1)
+
+# Get group info for averaging
+grp <- gsub("(.+)\\.Retina.+", "\\1", colnames(retina.dwnld)[10:31])
+exp_grp <- factor(grp, levels = unique(grp))
+
+# Get average CPM values
+retina_cpm <- data.frame(merge(retina.dwnld[,1:9],
+                               log2(DFave(retina.dwnld[,10:31], exp_grp) + 1),
+                               by = 0),
+                         row.names = 1)
+
+
+#############################################
+# Import the H3K27ac from Aldiri
+k27_aldiri_beds <- list.files(path = "/Volumes/data/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bed/", pattern = "*H3K27Ac*", recursive = T, full.names = T)
+names(k27_aldiri_beds) <- gsub(".+\\/(.+)_H3K27.+", "\\1", k27_aldiri_beds)
+
+# Import the beds 
+k27_aldiri <- sapply(k27_aldiri_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(k27_aldiri)){
+  k27_aldiri[[i]] <- GenomicRanges::reduce(k27_aldiri[[i]])
+  seqlevelsStyle(k27_aldiri[[i]]) <- "NCBI"
+}
+
+
+#############################################
+# Import the H3K4me3 from Aldiri
+k4me3_aldiri_beds <- list.files(path = "/Volumes/data/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bed/", pattern = "*H3K4me3_*", recursive = T, full.names = T)
+names(k4me3_aldiri_beds) <- gsub(".+\\/(.+)_H3K4me3.+", "\\1", k4me3_aldiri_beds)
+
+# Import the beds 
+k4me3_aldiri <- sapply(k4me3_aldiri_beds, toGRanges, format="narrowPeak")
+
+for (i in 1:length(k4me3_aldiri)){
+  k4me3_aldiri[[i]] <- GenomicRanges::reduce(k4me3_aldiri[[i]])
+  seqlevelsStyle(k4me3_aldiri[[i]]) <- "NCBI"
+}
+
+
+
+#############################################
+# Import the time course sig DB regions
+tc_prom_pc_sig <- readRDS(file = "../data/interim/03_prom_pc_sig_240913.RDS")
+posi_cor <- readRDS(file = "../data/interim/03_h3k18la_db_dge_positive_corr_241001.RDS")
+anti_cor <- readRDS(file = "../data/interim/03_h3k18la_db_dge_anti_corr_241001.RDS")
+
+tc_peakAnno_cons <- readRDS("../data/interim/peakAnnoList_cons_240911.RDS")
+
+```                   
+                         
+
+### Annotate outside data
+```{r}
+
+# Aldiri k27ac 
+k27AnnoList_ens <- list()
+
+for (i in 1:length(k27_aldiri)){
+  
+  peak_tmp <- k27_aldiri[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+
+  k27AnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(k27AnnoList_ens) <- names(k27_aldiri)
+
+
+# Aldiri k4me3 
+k4me3AnnoList_ens <- list()
+
+for (i in 1:length(k4me3_aldiri)){
+  
+  peak_tmp <- k4me3_aldiri[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+
+  k4me3AnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(k4me3AnnoList_ens) <- names(k4me3_aldiri)
+
+
+```
+
+
+
+################################################################################
+### Get the counts over annotated feature regions
+################################################################################
+```{r}
+library(tidyverse)
+library(ChIPpeakAnno)
+library(ChIPseeker)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(GenomicFeatures)
+library(csaw)
+
+############################
+# Master features
+mstr_features_anno <- readRDS(file = "../data/interim/03_mstr_features_anno_240913.RDS")
+mstr_features_anno_ucsc <- mstr_features_anno
+seqlevels(mstr_features_anno_ucsc@anno) <- paste0("chr", seqlevels(mstr_features_anno@anno))
+
+# Params
+pe.param <- readParam(max.frag=600, pe="both", minq = 20, dedup = T)
+se.param <- readParam(max.frag=600, pe="none", minq = 20, dedup = T)
+
+############################
+# H3K18la
+
+# Get bam files
+bam_dir <- "../data/raw/bams/"
+bams <- list.files(path = bam_dir, pattern = "H3K18La_P.+.bam$")
+bams <- bams[c(6:7, 1:2, 3:5)]
+bam.files <- paste0(bam_dir, bams)
+
+# Annotated region counts
+h3k18la_counts <- regionCounts(bam.files, mstr_features_anno@anno, ext=150, param=pe.param)
+
+# Normalization
+binned <- windowCounts(bam.files, bin=TRUE, width=10000, param=se.param)
+h3k18la_se <- normFactors(binned, se.out=T)
+
+
+############################
+# H3K27ac
+
+# Get bam files
+bam_dir <- "/Volumes/data/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bam/"
+bams <- list.files(path = bam_dir, pattern = ".+H3K27Ac.+.bam$")
+bams <- bams[c(16:17, 10:11, 1:2)]
+bam.files <- paste0(bam_dir, bams)
+
+# Annotated region counts
+h3k27ac_counts <- regionCounts(bam.files, mstr_features_anno_ucsc@anno, ext=150, param=se.param)
+
+# Normalization
+binned <- windowCounts(bam.files, bin=TRUE, width=10000, param=se.param)
+h3k27ac_se <- normFactors(binned, se.out=T)
+
+
+############################
+# H3K4me3
+
+# Get bam files
+bam_dir <- "/Volumes/data/NGS/ChIP-seq/ENCODE_v1_4_0/Mouse/Aldiri_GSE87037/bam/"
+bams <- list.files(path = bam_dir, pattern = ".+H3K4me3.+.bam$")
+bams <- bams[c(16:17, 9:10, 1:2)]
+bam.files <- paste0(bam_dir, bams)
+
+# Annotated region counts
+h3k4me3_counts <- regionCounts(bam.files, mstr_features_anno_ucsc@anno, ext=150, param=se.param)
+
+# Normalization
+binned <- windowCounts(bam.files, bin=TRUE, width=10000, param=se.param)
+h3k4me3_se <- normFactors(binned, se.out=T)
+
+
+
+```
+
+
+
+################################################################################
+### Prep the DGE list objects
+################################################################################
+```{r}
+library(edgeR)
+
+source(file.path(dest_tools_dir, "Expr_Filter.R"))
+
+
+##########
+## h3k18la
+samp_nm <- gsub(".+(H3K18La_.+)\\.target.+", "\\1", h3k18la_counts@colData[[1]])
+
+h3k18la.dge <- asDGEList(h3k18la_counts,
+               norm.factors = h3k18la_se$norm.factors,
+               group = gsub("H3K18La_(.+)_.+", "\\1", samp_nm),
+               genes = as.data.frame(mstr_features_anno))
+colnames(h3k18la.dge) <- samp_nm
+h3k18la.dge$samples$group <- factor(h3k18la.dge$samples$group, levels = unique(h3k18la.dge$samples$group))
+
+h3k18la.dge$rpkm <- rpkm(h3k18la.dge, gene.length = "width")
+
+h3k18la.dge$rpkm_mean <- h3k18la.dge$rpkm %>% 
+  as_tibble() %>% 
+  rowwise() %>% 
+  transmute(P4 = mean(c(H3K18La_P4_R1, H3K18La_P4_R2)),
+         P10 = mean(c(H3K18La_P10_R1, H3K18La_P10_R2)),
+         P28 = mean(c(H3K18La_P28_R1, H3K18La_P28_R2, H3K18La_P28_R3)))
+
+h3k18la.pc.prom <- cbind(h3k18la.dge$genes, h3k18la.dge$rpkm_mean) %>% 
+  dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding")
+
+
+
+
+##########
+## h3k27ac
+samp_nm <- gsub(".+([Pa].+H3K27Ac).+", "\\1", h3k27ac_counts@colData[[1]])
+samp_nm <- paste(samp_nm, rep(c("R1", "R2"), 3), sep = "_")
+h3k27ac.dge <- asDGEList(h3k27ac_counts,
+               norm.factors = h3k27ac_se$norm.factors,
+               group = gsub("_.+", "", samp_nm),
+               genes = as.data.frame(mstr_features_anno))
+colnames(h3k27ac.dge) <- samp_nm
+h3k27ac.dge$samples$group <- factor(h3k27ac.dge$samples$group, levels = unique(h3k27ac.dge$samples$group))
+
+h3k27ac.dge$rpkm <- rpkm(h3k27ac.dge, gene.length = "width")
+
+h3k27ac.dge$rpkm_mean <- h3k27ac.dge$rpkm %>% 
+  as_tibble() %>% 
+  rowwise() %>% 
+  transmute(P4 = mean(c(P3_H3K27Ac_R1, P3_H3K27Ac_R2)),
+         P10 = mean(c(P10_H3K27Ac_R1, P10_H3K27Ac_R2)),
+         P28 = mean(c(adult_H3K27Ac_R1, adult_H3K27Ac_R2)))
+
+h3k27ac.pc.prom <- cbind(h3k27ac.dge$genes, h3k27ac.dge$rpkm_mean) %>% 
+  dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding")
+
+
+##########
+## h3k4me3
+samp_nm <- gsub(".+([Pa].+H3K4me3).+", "\\1", h3k4me3_counts@colData[[1]])
+samp_nm <- paste(samp_nm, rep(c("R1", "R2"), 3), sep = "_")
+h3k4me3.dge <- asDGEList(h3k4me3_counts,
+               norm.factors = h3k4me3_se$norm.factors,
+               group = gsub("_.+", "", samp_nm),
+               genes = as.data.frame(mstr_features_anno))
+colnames(h3k4me3.dge) <- samp_nm
+h3k4me3.dge$samples$group <- factor(h3k4me3.dge$samples$group, levels = unique(h3k4me3.dge$samples$group))
+
+h3k4me3.dge$rpkm <- rpkm(h3k4me3.dge, gene.length = "width")
+
+h3k4me3.dge$rpkm_mean <- h3k4me3.dge$rpkm %>% 
+  as_tibble() %>% 
+  rowwise() %>% 
+  transmute(P4 = mean(c(P3_H3K4me3_R1, P3_H3K4me3_R2)),
+         P10 = mean(c(P10_H3K4me3_R1, P10_H3K4me3_R2)),
+         P28 = mean(c(adult_H3K4me3_R1, adult_H3K4me3_R2)))
+
+h3k4me3.pc.prom <- cbind(h3k4me3.dge$genes, h3k4me3.dge$rpkm_mean) %>% 
+  dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding")
+
+```
+
+
+
+################################################################################
+### Alluvial plot of promoter peak histone presence - Figure 3
+################################################################################
+```{r}
+library(ggalluvial)
+
+
+thresh = 2
+# Prep the gene lists for the FGE loop
+gene_list_P4 <- list(H3K27ac = h3k27ac.pc.prom %>% 
+                       dplyr::filter(P4 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K4me3 = h3k4me3.pc.prom %>% 
+                       dplyr::filter(P4 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K18la = h3k18la.pc.prom %>% 
+                       dplyr::filter(P4 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F))
+
+gene_list_P10 <- list(H3K27ac = h3k27ac.pc.prom %>% 
+                       dplyr::filter(P10 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K4me3 = h3k4me3.pc.prom %>% 
+                       dplyr::filter(P10 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K18la = h3k18la.pc.prom %>% 
+                       dplyr::filter(P10 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F))
+
+gene_list_P28 <- list(H3K27ac = h3k27ac.pc.prom %>% 
+                       dplyr::filter(P28 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K4me3 = h3k4me3.pc.prom %>% 
+                       dplyr::filter(P28 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F),
+                     H3K18la = h3k18la.pc.prom %>% 
+                       dplyr::filter(P28 > thresh) %>% 
+                       dplyr::select(SYMBOL) %>% 
+                       as.vector() %>% unlist(use.names = F))
+
+
+
+
+goi_list <- list(gene_list_P4, gene_list_P10, gene_list_P28)
+names(goi_list) <- c("P4", "P10", "P28")
+
+total_gois <- c(gene_list_P4 %>% unlist(use.names = F) %>% unique(),
+                gene_list_P10 %>% unlist(use.names = F) %>% unique(),
+                gene_list_P28 %>% unlist(use.names = F) %>% unique()) %>% unique()
+
+
+# Prep DF for alluvial plot
+df_alluv <- data.frame()
+
+# 
+for (i in names(goi_list)){
+  
+  tmp_venn <- ggVennDiagram::Venn(goi_list[[i]])
+  tmp_data <- ggVennDiagram::process_data(tmp_venn)
+  tmp_regions <- tmp_data@region$item
+  names(tmp_regions) <- tmp_data@region$name
+
+  for (ii in names(tmp_regions)){
+    
+    tmp_genes <- tmp_regions[[ii]]
+    tmp_df <- data.frame(Symbol = tmp_genes,
+                         TP = i,
+                         Region = ii)
+   
+    
+    df_alluv <- rbind(df_alluv, tmp_df)
+      
+  }
+  
+   tmp_df_missing <- data.frame(Symbol = total_gois[!(total_gois %in% (tmp_regions %>% unlist(use.names = F) %>% unique()))],
+                                TP = i,
+                                Region = NA)
+   df_alluv <- rbind(df_alluv, tmp_df_missing)
+}
+
+df_alluv$TP <- factor(df_alluv$TP, levels = c("P4", "P10", "P28"))
+df_alluv <- df_alluv %>% as.tibble() %>% replace_na(list(Region = "no_mark"))
+
+hist_barplot_levels <- df_alluv$Region %>% unique() %>% sort()
+hist_barplot_levels <- hist_barplot_levels[c(8,1,6,2,7,3,4,5)]
+# hist_barplot_levels[1] <- NA
+df_alluv$Region <- factor(df_alluv$Region, levels = hist_barplot_levels)
+
+gga <- ggplot(df_alluv, aes(x = TP, stratum = Region, alluvium = Symbol, fill = Region, label = Region)) +
+  # scale_fill_brewer(type = "qual", palette = "Set2") +
+  # scale_fill_viridis_b() +
+  geom_flow(stat = "alluvium", lode.guidance = "rightleft", alpha = 0.2) +
+  geom_stratum(alpha = 0.75) +
+  theme(legend.position = "bottom") +
+  ggtitle("Histone occupancy in promoter region during development") 
+cowplot::ggsave2(gga, filename = "../data/processed/08_Alluvial_Prom_18la-27ac-4me3_241008_filt2.pdf",
+                 height = 8, width = 12)
+
+saveRDS(object = df_alluv, file = "../data/interim/08_df_alluvial_241008_filt2.RDS")
+
+```
+
+
+### Perform FGE on Alluvial segments - Figure 3
+```{r}
+
+source(file.path(dest_tools_dir, "GO_Leaf.R"))
+
+df_alluv_spread <- df_alluv %>% spread(TP, Region)
+
+
+goi_list_alluv <- list(P4_all3 = df_alluv_spread %>% 
+                         dplyr::filter(P4 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P10_acquired_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(!(P4 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P10 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_acquired_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(!(P10 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P28 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la_H3K4me3 = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la_H3K27ac = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K27ac..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       H3K18la_acquired = df_alluv_spread %>% 
+                         dplyr::filter(!(P4 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P10 == "H3K27ac..H3K4me3..H3K18la",
+                                       P28 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F))
+
+
+# Perform FGE on the GOIs from each subset of peaks
+
+org = "org.Mm.eg.db"
+
+enrich_db <- "GO_220310"
+GOont <- "BP"
+top <- 12
+
+# dir_enrich <- file.path(dir_res, "FuncGeneEnrich")
+dir_export <- "../data/processed"
+dir_enrich <- file.path(dir_export, paste0("08_Alluvial_Regions_241009v2_", enrich_db, "_", GOont))
+dir.create(dir_enrich)
+
+# univ <- df_alluv_spread$Symbol
+univ <- mstr_features_anno@anno$SYMBOL %>% unique() 
+  
+enrich_results <- clusterProfiler::compareCluster(geneClusters = goi_list_alluv, fun = "enrichGO",
+                                          keyType = "SYMBOL", ont = GOont, OrgDb = org, univ = univ)
+
+
+# Filter enrichment for significance
+enrich_results_filt <- enrich_results@compareClusterResult %>% dplyr::filter(p.adjust < 0.05, Count > 3)
+
+# Fix the Ratio
+enrich_results_filt_fix <- enrich_results_filt %>% 
+  as.data.frame() %>% 
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+  rowwise() %>% 
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Export the FGE results table
+tmp <- enrich_results_filt_fix[,-11]
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_full.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+
+
+# Get leaf terms
+enrich_results_leaf <- GO_leaf(enrich_results_filt, query = 1, id.col = 2, ont = GOont)
+
+# Fix the Ratio
+enrich_results_leaf_fix <- enrich_results_leaf %>% 
+  as.data.frame() %>% 
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+  rowwise() %>% 
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Simplify the ernichment
+simp <- clusterProfiler::simplify(enrich_results)
+write.table(simp@compareClusterResult, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_simp.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+
+# Export the FGE results table
+tmp <- enrich_results_leaf_fix[,-11]
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_leaf.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+# Get top 5 pathways per cell type to get union set of pathways
+top5_union <- enrich_results_leaf %>% 
+  group_by(Cluster) %>% 
+  arrange(p.adjust) %>% 
+  slice_head(n = top)
+
+
+# Filter the full table for the union of top5 pathways
+top5_enrich <- enrich_results_filt_fix %>% 
+  dplyr::filter(ID %in% (top5_union$ID %>% unique()))
+
+# Prep the df for plotting
+top5_enrich <- top5_enrich %>% 
+  arrange(Cluster, p.adjust)
+top5_enrich$Description <- substring(top5_enrich$Description, 1, 60)
+top5_enrich$Description <- factor(top5_enrich$Description, levels = rev(unique(top5_enrich$Description)))
+top5_enrich$p.adjust <- -log10(top5_enrich$p.adjust)
+
+# Make plot
+pp <- ggplot(top5_enrich, aes(Cluster, Description, colour = p.adjust)) + 
+    geom_point(aes(size = Ratio)) + 
+    theme_bw() +
+    scale_colour_gradient(low = "#3B9AB2", high = "#F21A00", name = "P Value\n-log10", limits=c(0,10), oob = scales::squish) +
+    guides(size=guide_legend(title="Ratio")) +
+    theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1)) +
+    ggtitle(paste0("H3K18la Peaks in ", i))
+
+#Open the pdf device
+cowplot::ggsave2(plot = pp, filename = file.path(dir_enrich, paste0(i, "_Alluvial-Region_FGE_top_", top, "_leaf_01_dotplot.pdf")),
+                 height = top5_enrich$Description %>% unique() %>% length() / 10 + 2.5, 
+                 width = 6)
+    
+
+# Make a bargraph of top 25 from simplified enriched results
+source("../src/tools/Barplot_GO.R")
+
+bar_plot_list <- list()
+top = 50
+for (i in simp@compareClusterResult$Cluster %>% unique()){
+  tmp_res <- simp@compareClusterResult %>% dplyr::filter(Cluster == i)
+  tmp_res <- tmp_res %>% slice_head(n = top)
+  tmp_res$Description <- factor(tmp_res$Description, levels = rev(tmp_res$Description))
+  bp <- ggplot(tmp_res, aes(x = Description, y = Count, fill = -log10(p.adjust))) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+   # scale_fill_gradient(low="#3B9AB2", high="#F21A00", name="P Value \n(-log10)",limits=c(0,10), oob = scales::squish) +
+     scale_fill_gradient2(low="#225ea8", mid="#7fcdbb", high="#ffffd9", midpoint = 5, name="P Value \n(-log10)",limits=c(0,10), oob = scales::squish) +
+    labs(y="Number of Significant Genes", x=NULL) +
+    theme_bw()
+  cowplot::ggsave2(plot = bp, filename = file.path(dir_enrich, paste0(i, "_Alluvial-Region_FGEsimp_top_", top, "_barplotv2.pdf")),
+                 height = 12, 
+                 width = 10)
+  # bar_go(tmp_res, top = 25, desc = "Description", p.val = "p.adjust", genenum = "Count", filenm = file.path(dir_enrich, paste0(i, "_FGE_simp_", i,"_top_", top, "_barplat.pdf")))
+}
+# bar_go(simp@compareClusterResult, top = 25, desc = "Description", p.val = "p.adjust", genenum = "Count")
+
+
+
+
+```
+
+
+
+
+################################################################################
+### RNAseq correlated Alluvial plot - Figure 4
+################################################################################
+```{r}
+library(ggalluvial)
+
+# Load alluvial data.frame from 02
+# df_alluv <- readRDS("../data/interim/02_df_alluvial.RDS")
+
+# Correlated genes
+df_alluv_corr <- df_alluv %>% 
+  dplyr::filter(Symbol %in% posi_cor$SYMBOL)
+
+gga <- ggplot(df_alluv_corr, aes(x = TP, stratum = Region, alluvium = Symbol, fill = Region, label = Region)) +
+  # scale_fill_brewer(type = "qual", palette = "Set2") +
+  # scale_fill_viridis_b() +
+  geom_flow(stat = "alluvium", lode.guidance = "rightleft", alpha = 0.2) +
+  geom_stratum(alpha = 0.75) +
+  theme(legend.position = "bottom") +
+  ggtitle("Histone occupancy in correlated promoter region during development") 
+
+cowplot::ggsave2(gga, filename = file.path(dir_export, paste0("08_Alluvial_Corr_Prom_18la-27ac-4me3.pdf")),
+                 height = 8, width = 12)
+
+
+# Anti-Correlated genes
+df_alluv_anticorr <- df_alluv %>% 
+  dplyr::filter(Symbol %in% anti_cor$SYMBOL)
+
+gga <- ggplot(df_alluv_anticorr, aes(x = TP, stratum = Region, alluvium = Symbol, fill = Region, label = Region)) +
+  # scale_fill_brewer(type = "qual", palette = "Set2") +
+  # scale_fill_viridis_b() +
+  geom_flow(stat = "alluvium", lode.guidance = "rightleft", alpha = 0.2) +
+  geom_stratum(alpha = 0.75) +
+  theme(legend.position = "bottom") +
+  ggtitle("Histone occupancy in anti-correlated promoter region during development") 
+
+cowplot::ggsave2(gga, filename = file.path(dir_export, paste0("08_Alluvial_AntiCorr_Prom_18la-27ac-4me3.pdf")),
+                 height = 8, width = 12)
+
+
+# Un-Correlated genes
+df_alluv_uncorr <- df_alluv %>% 
+  dplyr::filter(!(Symbol %in% c(posi_cor$SYMBOL, anti_cor$SYMBOL)))
+
+gga <- ggplot(df_alluv_uncorr, aes(x = TP, stratum = Region, alluvium = Symbol, fill = Region, label = Region)) +
+  # scale_fill_brewer(type = "qual", palette = "Set2") +
+  # scale_fill_viridis_b() +
+  geom_flow(stat = "alluvium", lode.guidance = "rightleft", alpha = 0.2) +
+  geom_stratum(alpha = 0.75) +
+  theme(legend.position = "bottom") +
+  ggtitle("Histone occupancy in uncorrelated promoter region during development") 
+
+cowplot::ggsave2(gga, filename = file.path(dir_export, paste0("08_Alluvial_UnCorr_Prom_18la-27ac-4me3.pdf")),
+                 height = 8, width = 12)
+
+
+```
+
+
+
+### Perform FGE on Alluvial segments - Figure 4
+```{r}
+source("../src/tools/GO_leaf.R")
+
+df_alluv_spread <- df_alluv_corr %>% spread(TP, Region)
+
+
+goi_list_alluv <- list(P4_all3 = df_alluv_spread %>% 
+                         dplyr::filter(P4 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P10_acquired_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(!(P4 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P10 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_acquired_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(!(P10 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P28 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la_H3K4me3 = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       P28_H3K18la_H3K27ac = df_alluv_spread %>% 
+                         dplyr::filter(P28 == "H3K27ac..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F),
+                       H3K18la_acquired = df_alluv_spread %>% 
+                         dplyr::filter(!(P4 == "H3K27ac..H3K4me3..H3K18la"), 
+                                       P10 == "H3K27ac..H3K4me3..H3K18la",
+                                       P28 == "H3K27ac..H3K4me3..H3K18la") %>% 
+                         dplyr::select(Symbol) %>% 
+                         as.vector() %>% unlist(use.names = F))
+
+
+# Perform FGE on the GOIs from each subset of peaks
+
+org = "org.Mm.eg.db"
+
+enrich_db <- "GO_220310"
+GOont <- "BP"
+top <- 10
+
+# dir_enrich <- file.path(dir_res, "FuncGeneEnrich")
+dir_enrich <- file.path(dir_export, paste0("08_Alluvial_Regions_Corr_", enrich_db, "_", GOont))
+dir.create(dir_enrich)
+
+# univ <- df_alluv_spread$Symbol
+univ <- mstr_features_anno@anno$SYMBOL %>% unique()
+  
+enrich_results <- clusterProfiler::compareCluster(geneClusters = goi_list_alluv, fun = "enrichGO",
+                                          keyType = "SYMBOL", ont = GOont, OrgDb = org)
+
+
+# Filter enrichment for significance
+enrich_results_filt <- enrich_results@compareClusterResult %>% dplyr::filter(p.adjust < 0.05, Count > 3)
+
+# Fix the Ratio
+enrich_results_filt_fix <- enrich_results_filt %>% 
+  as.data.frame() %>% 
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+  rowwise() %>% 
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Export the FGE results table
+tmp <- enrich_results_filt_fix[,-11]
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_", i, "_full.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+# Simplify the ernichment
+simp <- clusterProfiler::simplify(enrich_results)
+write.table(simp@compareClusterResult, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_simp.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+
+# Get leaf terms
+enrich_results_leaf <- GO_leaf(enrich_results_filt, query = 1, id.col = 2, ont = GOont)
+
+# Fix the Ratio
+enrich_results_leaf_fix <- enrich_results_leaf %>% 
+  as.data.frame() %>% 
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>% 
+  rowwise() %>% 
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Export the FGE results table
+tmp <- enrich_results_leaf_fix[,-11]
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_", i, "_leaf.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+# Get top 5 pathways per cell type to get union set of pathways
+# top_union <- enrich_results_leaf %>%
+top_union <- simp@compareClusterResult %>%
+  group_by(Cluster) %>% 
+  arrange(p.adjust) %>% 
+  slice_head(n = top)
+
+
+# Filter the full table for the union of top5 pathways
+top_enrich <- enrich_results_filt_fix %>% 
+  dplyr::filter(ID %in% (top_union$ID %>% unique()))
+
+# Prep the df for plotting
+top_enrich <- top_enrich %>% 
+  arrange(Cluster, p.adjust)
+top_enrich$Description <- substring(top_enrich$Description, 1, 60)
+top_enrich$Description <- factor(top_enrich$Description, levels = rev(unique(top_enrich$Description)))
+top_enrich$p.adjust <- -log10(top_enrich$p.adjust)
+
+# Make plot
+pp <- ggplot(top_enrich, aes(Cluster, Description, colour = p.adjust)) + 
+    geom_point(aes(size = Ratio)) + 
+    theme_bw() +
+    scale_colour_gradient(low = "#3B9AB2", high = "#F21A00", name = "P Value\n-log10", limits=c(0,10), oob = scales::squish) +
+    guides(size=guide_legend(title="Ratio")) +
+    theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1)) +
+    ggtitle(paste0("GO:BP in Histone Occupancy in Correlated peaks"))
+
+#Export plot
+cowplot::ggsave2(plot = pp, filename = file.path(dir_enrich, paste0(i, "_Alluvial-Region_FGE_top_", top, "_", i, "_simp_01_dotplot.pdf")),
+                 height = top5_enrich$Description %>% unique() %>% length() / 10 + 2.5, 
+                 width = 6)
+
+# Make barplots for each section
+
+for (i in top_union$Cluster){
+  tmp_dat <- top_union %>% dplyr::filter(Cluster == i)
+  tmp_dat$Description <- factor(tmp_dat$Description, levels = rev(tmp_dat$Description))
+  
+  bp <- ggplot(tmp_dat) +
+      geom_bar(stat = 'identity', aes(x=Description, y = Count, fill = -log10(p.adjust))) +
+      coord_flip() +
+      scale_fill_gradient(low="#3B9AB2", high="#F21A00", name="P Value \n(-log10)",limits=c(0,10), oob = scales::squish) +
+      #scale_fill_gradientn(colors = c("#3B9AB2", "#F21A00"), name="P Value (log10)", trans = 'reverse', limits=c(-50,0), oob=squish) +
+      labs(y="Number of Significant Genes", x=NULL) +
+      ggtitle(paste0("GO:BP - ", i)) +
+      theme_bw()
+  cowplot::ggsave2(plot = bp, filename = file.path(dir_enrich, paste0("Alluvial-Region_FGE_top_", top, "_", i, "_leaf_01_barplot.pdf")),
+                 height = 4, 
+                 width = 8)
+}
+
+top <- 10
+for (i in simp@compareClusterResult$Cluster){
+  tmp_dat <- simp@compareClusterResult %>% as.data.frame() %>% dplyr::filter(Cluster == i)
+  tmp_dat <- tmp_dat %>% slice_head(n = top)
+  tmp_dat$Description <- factor(tmp_dat$Description, levels = rev(tmp_dat$Description))
+  
+  bp <- ggplot(tmp_dat) +
+      geom_bar(stat = 'identity', aes(x=Description, y = Count, fill = -log10(p.adjust))) +
+      coord_flip() +
+      # scale_fill_gradient(low="#3B9AB2", high="#F21A00", name="P Value \n(-log10)",limits=c(0,10), oob = scales::squish) +
+      scale_fill_gradient2(low="#225ea8", mid="#7fcdbb", high="#ffffd9", midpoint = 5, name="P Value \n(-log10)",limits=c(0,10), oob = scales::squish) +
+      #scale_fill_gradientn(colors = c("#3B9AB2", "#F21A00"), name="P Value (log10)", trans = 'reverse', limits=c(-50,0), oob=squish) +
+      labs(y="Number of Significant Genes", x=NULL) +
+      ggtitle(paste0("GO:BP - ", i)) +
+      theme_bw()
+  cowplot::ggsave2(plot = bp, filename = file.path(dir_enrich, paste0("Alluvial-Region_FGE_top_", top, "_", i, "_simp_01_barplot_v2.pdf")),
+                 height = 4, 
+                 width = 8)
+}
+
+tmp_res <- simp@compareClusterResult %>% dplyr::filter(Cluster == i)
+  tmp_res <- tmp_res %>% slice_head(n = top)
+  tmp_res$Description <- factor(tmp_res$Description, levels = rev(tmp_res$Description))
+
+```
+
+

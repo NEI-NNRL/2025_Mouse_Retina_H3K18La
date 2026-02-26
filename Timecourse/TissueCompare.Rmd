@@ -1,0 +1,256 @@
+---
+title: "H3K18la Tissue Comparison Analysis"
+output: html_notebook
+
+---
+
+
+### Get custom scripts and functions and outside data used for analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+library(tidyverse)
+
+```
+
+
+### Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+## Query for all available EnsDb databases
+ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+
+ensDb <- ahdb[[1]]
+
+
+
+ahdb_hs <- query(ah, pattern = c("EnsDb", "Homo sapiens", 109))
+
+ensDb_hs <- ahdb_hs[[1]]
+
+```
+
+
+################################################################################
+### Import the Galle peaks from nf-core pipeline, process them the same way as retina and then compare
+################################################################################
+
+### Import the peaks into a merged list object and plot for number of peaks at each timepoint
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(ChIPpeakAnno)
+
+macs_dir <- "../data/external/Galle_nf-core/04_called_peaks/macs2/"
+macs_beds <- list.files(path = macs_dir, pattern = "H3K18.+narrowPeak", recursive = T)
+
+# Import the cons peaks
+peakList <- sapply(file.path(macs_dir, macs_beds), toGRanges, format="narrowPeak")
+names(peakList) <- gsub("(.+).macs.+", "\\1", macs_beds)
+
+peakList_1E6 <- GRangesList()
+
+for (i in 1:length(peakList)){
+  
+  # seqlevelsStyle(peakList[[i]]) <- "NCBI"
+  tmp_peak <- sortSeqlevels(peakList[[i]])
+  tmp_peak <- GenomicRanges::sort(tmp_peak)
+  tmp_peak <- tmp_peak[(elementMetadata(tmp_peak)[,"qValue"] > 6) & (seqnames(tmp_peak) != "MT")]
+  peakList_1E6[[i]] <- tmp_peak
+}
+names(peakList_1E6) <- gsub("(.+).macs.+", "\\1", macs_beds)
+
+
+ol_ADIPO <- findOverlapsOfPeaks(c(peakList_1E6[1],
+                             peakList_1E6[2]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_ESC_2i <- findOverlapsOfPeaks(c(peakList_1E6[4],
+                             peakList_1E6[5]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_ESC_ser <- findOverlapsOfPeaks(c(peakList_1E6[6],
+                             peakList_1E6[7]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_GAS <- findOverlapsOfPeaks(c(peakList_1E6[8],
+                             peakList_1E6[9]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_MT <- findOverlapsOfPeaks(c(peakList_1E6[11],
+                             peakList_1E6[12]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_PIM <- findOverlapsOfPeaks(c(peakList_1E6[13],
+                             peakList_1E6[14]), connectedPeaks="keepAll", ignore.strand = T)
+
+peakList_cons <- GRangesList(ol_ADIPO$mergedPeaks, peakList_1E6$BMDM_H3K18la_R1, 
+                             ol_ESC_2i$mergedPeaks, ol_ESC_ser$mergedPeaks,
+                             ol_GAS$mergedPeaks, peakList_1E6$MB_H3K18la_R1, 
+                             ol_MT$mergedPeaks, ol_PIM$mergedPeaks)
+nm <- gsub("_H3K18la.+", "", names(peakList_1E6)) %>% unique()
+nm <- gsub("-", "_", nm)
+names(peakList_cons) <- nm
+
+```
+
+
+## Annotate outside peaks with ensembl db
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(ChIPseeker)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(GenomicFeatures)
+
+
+peakAnnoList_galle_nf <- list()
+
+for (i in 1:length(peakList_cons)){
+  
+  peak_tmp <- peakList_cons[[i]]
+  names(peak_tmp) <- paste0("X", 1:length(peak_tmp))
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+  
+  peakAnnoList_galle_nf[[i]] <- anno_tmp
+
+}
+
+names(peakAnnoList_galle_nf) <- names(peakList_cons)
+
+```
+
+
+### Make upset and distance plot of promoter genes for the different tissues
+```{r}
+
+# Make upset plot based on presence of peak in promoter of gene
+genes_list <- list(RETINA = (tc_peakAnno_cons$P28@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        ADIPO = (peakAnnoList_galle_nf$ADIPO@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        BMDM = (peakAnnoList_galle_nf$BMDM@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        GAS = (peakAnnoList_galle_nf$GAS@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        MB = (peakAnnoList_galle_nf$MB@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        MT = (peakAnnoList_galle_nf$MT@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()),
+                        PIM = (peakAnnoList_galle_nf$PIM@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()))
+
+u2 <- upset(fromList(genes_list), 
+      nintersects = 14, 
+      nsets = 7, 
+      order.by = "freq", 
+      decreasing = T, 
+      mb.ratio = c(0.6, 0.4),
+      number.angles = 0, 
+      text.scale = 1.1, 
+      point.size = 2.8, 
+      line.size = 1
+      )
+
+pdf("../data/processed/P28-Galle_Prom-PC_nf_peak_upset_GeneBased.pdf", 
+    width = 9, height = 6, onefile = F)
+u2
+dev.off()
+
+
+# Make dendro plots based on presence of peak in promoter of gene
+library(rafalib)
+library(Hmisc)
+library(corrplot)
+
+# Get genes for matrix
+genes_galle <- lapply(peakAnnoList_galle_nf, function(x){x@anno %>% 
+    as.data.frame() %>% 
+    dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+    dplyr::select(SYMBOL)}) %>% 
+  unlist() %>% sort() %>% unique()
+
+genes_P28 <- tc_peakAnno_cons$P28@anno %>% 
+  as.data.frame() %>% 
+  dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+  dplyr::select(SYMBOL) %>% 
+  unlist() %>% sort() %>% unique()
+
+genes_all <- c(genes_galle, genes_P28) %>% sort() %>% unique()
+
+# Make matrix
+genes_mat <- data.frame(RETINA = ifelse(genes_all %in% (tc_peakAnno_cons$P28@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        ADIPO = ifelse(genes_all %in% (peakAnnoList_galle_nf$ADIPO@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        BMDM = ifelse(genes_all %in% (peakAnnoList_galle_nf$BMDM@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        GAS = ifelse(genes_all %in% (peakAnnoList_galle_nf$GAS@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        MB = ifelse(genes_all %in% (peakAnnoList_galle_nf$MB@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        MT = ifelse(genes_all %in% (peakAnnoList_galle_nf$MT@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0),
+                        PIM = ifelse(genes_all %in% (peakAnnoList_galle_nf$PIM@anno %>% 
+                                          as.data.frame() %>% 
+                                          dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+                                          dplyr::select(SYMBOL) %>% 
+                                          unlist() %>% sort() %>% unique()), 1, 0), row.names = genes_all)
+
+
+# Drop similar genes
+genes_nonsim <- genes_mat[rowSums(genes_mat) %in% c(2:6),]
+
+# Dendrogram of correlation
+d2 <- dist(c2)
+hc2 <- hclust(d2, method="ward.D2")
+
+pdf(file="../data/processed/CorrDendro_sharedGenes.pdf", width=8, height=4, useDingbats = F)
+par(mar=c(4,4,1,1))
+myplclust(hclust = hc2)
+dev.off()
+
+```
+
