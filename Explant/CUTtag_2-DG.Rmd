@@ -1,0 +1,907 @@
+---
+title: "H3K18la Explant 2-DG Analysis"
+output: html_notebook
+
+---
+
+
+### Get custom scripts and functions and outside data used for analysis
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+script_dir <- "https://raw.githubusercontent.com/MBrooks313/R_codes/master"
+dest_tools_dir <- "../src/tools"
+dest_vis_dir <- "../src/visualization"
+
+download.file(url = file.path(script_dir, "GO_leaf.R"),
+              destfile = file.path(dest_tools_dir, "GO_leaf.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "Expr_Filter.R"),
+              destfile = file.path(dest_tools_dir, "Expr_Filter.R"),
+              method = "curl")
+
+download.file(url = file.path(script_dir, "VolcanoPlot.R"),
+              destfile = file.path(dest_tools_dir, "VolcanoPlot.R"),
+              method = "curl")
+
+library(tidyverse)
+options(java.parameters = "-Xmx8000m")
+
+```
+
+# Get Ensembl annotation database
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(AnnotationHub)
+library(ensembldb)
+
+ah <- AnnotationHub()
+
+ahdb <- query(ah, pattern = c("EnsDb", "Mus musculus", 102))
+
+ensDb <- ahdb[[1]]
+
+```
+
+
+################################################################################
+### Import outside data
+################################################################################
+```{r}
+source("../src/tools/DFave.R")
+
+#############################################
+# Import db data for time-course H3K18La
+
+db_tc <- read.csv("/Volumes/data/People/brooksma/PEGASUS/Projects/Gaur/Analysis/cutntag_240522/240911/data/processed/H3k18la.db.results.tsv", sep = "\t")
+
+db_tc_sig_PromPC <- db_tc %>% dplyr::filter(annotation == "Promoter", 
+                                            transcriptBiotype == "protein_coding",
+                                            (abs(logFC.P10) > 1 | abs(logFC.P28)), 
+                                            FDR < 0.01)
+
+#############################################
+# Import data for 2-DG RNA-seq experiment
+
+rna.dge <- readRDS("../data/interim/gene.dge.filt.rds")
+rna_de_res <- read.csv("../data/processed/RNA_DE_2DG_results.tsv", sep = "\t")
+```
+
+
+################################################################################
+### All Explant 2-DG Samples
+################################################################################
+
+### Get metadata for samples
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+# ord <- c(1:4)
+
+# Macs2 beds
+macs_beds <- list.files(path = "../data/interim/bed/", pattern = "narrowPeak", recursive = T, full.names = T)
+macs_beds <- macs_beds[c(4:6, 1:3,
+                         11:12, 9:10)]
+# Meta sheet
+meta <- data.frame(Beds = macs_beds,
+                   Mark = gsub(".+\\/(.+)_.+_R.+\\.macs.+", "\\1", macs_beds),
+                   Treat = gsub(".+\\/H3.+_(.+)_R.+\\.macs.+", "\\1", macs_beds),
+                   Group = gsub(".+\\/(.+)_R.+", "\\1", macs_beds),
+                   Rep = paste0("R", c(rep(1:3, times = 3), rep(1:2, times = 2))),
+                   Run = gsub(".+\\/(25.+)\\/H.+", "\\1", macs_beds))
+
+names(macs_beds) <- paste(meta$Group, meta$Rep, sep = "_")
+
+meta$Group <- factor(meta$Group, levels = unique(meta$Group))
+
+```
+
+
+### Import the peaks into a merged list object and plot for number of peaks at each timepoint
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(ChIPpeakAnno)
+
+# Import the cons peaks
+peakList <- sapply(file.path(meta$Beds), toGRanges, format="narrowPeak")
+names(peakList) <- names(macs_beds)
+
+peakList_1E6 <- GRangesList()
+# Sort the cons peaks
+for (i in 1:length(peakList)){
+  
+  tmp_peak <- sortSeqlevels(peakList[[i]])
+  tmp_peak <- GenomicRanges::sort(tmp_peak)
+  tmp_peak <- tmp_peak[(elementMetadata(tmp_peak)[,"qValue"] > 6) & (seqnames(tmp_peak) != "MT")]
+  peakList_1E6[[i]] <- tmp_peak
+}
+names(peakList_1E6) <- names(macs_beds)
+
+# Get overlaps
+ol_La_cntl <- findOverlapsOfPeaks(c(peakList_1E6[1],
+                             peakList_1E6[2], 
+                             peakList_1E6[3]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_La_2DG <- findOverlapsOfPeaks(c(peakList_1E6[4],
+                             peakList_1E6[5], 
+                             peakList_1E6[6]), connectedPeaks="keepAll", ignore.strand = T)
+
+ol_Ac_cntl <- findOverlapsOfPeaks(c(peakList_1E6[10],
+                             peakList_1E6[11]), 
+                             connectedPeaks="keepAll", ignore.strand = T)
+
+ol_Ac_2DG <- findOverlapsOfPeaks(c(peakList_1E6[12],
+                             peakList_1E6[13]), connectedPeaks="keepAll", ignore.strand = T)
+
+peakList_cons <- GRangesList(ol_La_cntl$mergedPeaks, ol_La_2DG$mergedPeaks,
+                             ol_Ac_cntl$mergedPeaks, ol_Ac_2DG$mergedPeaks)
+names(peakList_cons) <- c("La_cntl", "La_2DG", "Ac_cntl", "Ac_2DG")
+
+
+# Get master features for quantitation
+mstr_features <- IRanges::reduce(c(peakList_cons[[1]],
+                         peakList_cons[[2]],
+                         peakList_cons[[4]],
+                         peakList_cons[[5]]))
+
+# Annotate the features
+mstr_features_anno <- annotatePeak(mstr_features, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+mstr_features_anno@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = mstr_features_anno@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+
+```
+
+
+### Import the peaks into a merged list object and plot for number of peaks at each timepoint. -Figure S4
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+library(ChIPpeakAnno)
+
+
+# Generate plot for peak number
+df <- lapply(peakList_cons, length) %>% as.data.frame() %>% gather("Sample", "Peaks")
+df$Sample <- gsub("K18La\\.", "", df$Sample)
+df$Sample <- gsub("X", "", df$Sample)
+df$Sample <- factor(df$Sample, levels = df$Sample)
+
+uniq_genes <- lapply(peakAnnoList_ens, function(x){x@anno$SYMBOL %>% unique() %>% length()}) %>% unlist() %>% as.vector()
+prom_genes <- lapply(peakAnnoList_ens, function(x){x@anno %>% 
+    as.data.frame() %>% 
+    dplyr::filter(annotation == "Promoter") %>% 
+    dplyr::select(SYMBOL) %>% 
+    as.vector() %>% unlist() %>% 
+    unique() %>% length()}) %>% 
+  unlist() %>% as.vector()
+
+b <- ggplot(df, aes(Sample, Peaks))+
+  geom_bar(stat = "identity", fill = "grey50") +
+  geom_point(aes(x = c(1:6), y = uniq_genes), colour = "red", size = 2) +
+  annotate("text", x = c(1:6), y = uniq_genes + 200, label = uniq_genes) +
+  geom_point(aes(x = c(1:6), y = prom_genes), colour = "blue", size = 2) +
+  annotate("text", x = c(1:6), y = prom_genes + 200, label = prom_genes) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 0.8, vjust = 0.8)) +
+  labs(title = "Peaks") + xlab(NULL)
+
+cowplot::ggsave2(plot = b, filename = "../data/processed/Peak_number_TP.pdf", height = 3, width = 2.5)
+
+```
+
+
+### Annotate peaks with ensembl db
+```{r, echo = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(ChIPseeker)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(GenomicFeatures)
+
+
+peakAnnoList_ens <- list()
+
+for (i in 1:length(peakList_cons)){
+  
+  peak_tmp <- peakList_cons[[i]]
+  seqlevelsStyle(peak_tmp) <- "NCBI"
+  
+  anno_tmp <- annotatePeak(peak_tmp, tssRegion=c(-1000, 500),
+                         TxDb=ensDb, addFlankGeneInfo = T,
+                         overlap = "all")
+  anno_tmp@anno$SYMBOL <- mapIds(x = ensDb, 
+                                         keys = anno_tmp@anno$geneId, 
+                                         column = "SYMBOL", 
+                                         keytype = "GENEID")
+
+  peakAnnoList_ens[[i]] <- anno_tmp
+
+}
+
+names(peakAnnoList_ens) <- names(peakList_cons)
+
+```
+
+
+### Evaluate location of peaks relative to annotation features - Figure 6
+```{r, echo = FALSE, results = 'asis', warning=FALSE, message=FALSE}
+
+promoter <- getPromoters(TxDb = ensDb, upstream = 3000, downstream = 3000)
+seqlevelsStyle(promoter) <- "NCBI"
+
+tagMatrixList <- list()
+for (i in names(peakList_cons)){
+  tagMatrixList[[i]] <- getTagMatrix(peakList_cons[[i]], windows=promoter)
+}
+
+
+# Plot annotation bargraph
+p <- plotAnnoBar(peakAnnoList_ens, title = "H3K18la peak annotation")
+print(p)
+
+pdf("../data/processed/Peak_annot_bar_allPeaks.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+# Plot disrtobution of peaks realtive to TSS
+p <- plotDistToTSS(peakAnnoList_ens,
+              title="Distribution of H3K18la peak to TSS")
+print(p)
+
+pdf("../data/processed/Peak_TSSdist_bar_allPeaks.pdf",
+    height = 3, width = 5, useDingbats = F)
+print(p)
+dev.off()
+
+
+```
+
+
+################################################################################
+### Get bam counts over mstr_feature
+################################################################################
+```{r}
+library(csaw)
+
+# Perform region counts
+pe.param <- readParam(max.frag=600, pe="both", minq = 20, dedup = T)
+
+h3k18la.counts <- regionCounts(meta$bams, mstr_features_anno@anno, ext=150, param=pe.param)
+
+
+# Normalization
+binned <- windowCounts(meta$bams, bin=TRUE, width=10000, param=pe.param)
+h3k18la_se <- normFactors(binned, se.out=T)
+
+```
+
+
+################################################################################
+### Prep the DGE list objects
+################################################################################
+```{r}
+library(edgeR)
+
+source(file.path(dest_tools_dir, "Expr_Filter.R"))
+
+
+##########
+## h3k18la
+
+h3k18la.dge <- asDGEList(h3k18la.counts,
+               norm.factors = h3k18la_se$norm.factors,
+               group = meta$Group,
+               genes = as.data.frame(mstr_features_anno))
+colnames(h3k18la.dge) <- paste(meta$Group, meta$Rep, sep = "_")
+
+h3k18la.dge$samples$Run <- meta$Run
+
+h3k18la.dge$rpkm <- rpkm(h3k18la.dge, gene.length = "width")
+ExpFilt(h3k18la.dge$rpkm, exp = 1, group = h3k18la.dge$samples$group)
+
+h3k18la.dge.filt <- h3k18la.dge[idx.filt, keep.lib.sizes = T]
+
+h3k18la.dge.filt$logCPM <- log2(cpm(h3k18la.dge.filt) + 1)
+h3k18la.dge.filt$logFPKM <- rpkm(h3k18la.dge.filt, gene.length = "width", normalized.lib.sizes = T, log = T, prior.count = 1)
+h3k18la.dge.filt$FPKM <- rpkm(h3k18la.dge.filt, gene.length = "width", normalized.lib.sizes = T, log = F)
+h3k18la.dge.filt$FPKM_mean <- h3k18la.dge.filt$FPKM %>% 
+  as_tibble() %>% 
+  rowwise() %>% 
+  transmute(H3K18LA_CNTRL = mean(c(H3K18LA_CNTRL_R1, H3K18LA_CNTRL_R2, H3K18LA_CNTRL_R3)),
+         H3K18LA_2DG = mean(c(H3K18LA_2DG_R1, H3K18LA_2DG_R2, H3K18LA_2DG_R3)),
+         H3K27AC_CNTRL = mean(c(H3K27AC_CNTRL_R1, H3K27AC_CNTRL_R2)),
+         H3K27AC_2DG = mean(c(H3K27AC_2DG_R1, H3K27AC_2DG_R2)))
+
+```
+
+
+################################################################################
+### PCA analysis - Figure S4
+################################################################################
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+
+library(PCAtools)
+library(wesanderson)
+
+#Prep the PCA data
+pca.h3k18la <- PCAtools::pca(h3k18la.dge.filt$logFPKM, metadata = meta)
+
+
+X='PC1'; Y='PC2'
+pca1 <- biplot(pca.h3k18la, x = X, y = Y,
+       colby = "Group", 
+       legendPosition = 'right', 
+       title = 'Peak Quant PCA',
+       subtitle = paste0(X, ' versus ', Y))
+
+cowplot::ggsave2(filename = "../data/processed/03b_PCA_PC1-2_group.pdf", plot = pca1,
+                 width = 8, height = 6)
+
+```
+
+
+################################################################################
+### Differential binding analysis - Figure 6
+################################################################################
+```{r,echo=FALSE, results='asis', warning=FALSE, message=FALSE}
+library(edgeR)
+library(rtracklayer)
+library(qvalue)
+
+source(file.path(dest_tools_dir, "VolcanoPlot.R"))
+
+y <- h3k18la.dge.filt
+
+design <- model.matrix(~0 + h3k18la.dge.filt$samples$group)
+colnames(design) <- levels(h3k18la.dge.filt$samples$group)
+
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+
+fit <- glmQLFit(y, design, robust=TRUE)
+summary(fit$var.post)
+
+par(mfrow=c(1,2))
+o <- order(y$AveLogCPM)
+plot(y$AveLogCPM[o], sqrt(y$trended.dispersion[o]), type="l", lwd=2,
+ylim=c(0, 1), xlab=expression("Ave."~Log[2]~"CPM"),
+ylab=("Biological coefficient of variation"))
+plotQLDisp(fit)
+
+summary(fit$df.prior)
+
+LA_2DG <- glmQLFTest(fit, contrast=c(-1,1,0,0))
+AC_2DG <- glmQLFTest(fit, contrast=c(0,0,-1,1))
+
+
+# Export Results
+
+# LA_2DG
+LA_2DG$table$qvalue <- qvalue(LA_2DG$table$PValue)$qvalue
+LA_2DG$table$FDR <- p.adjust(LA_2DG$table$PValue, method = "fdr")
+
+expt <- cbind(LA_2DG$genes[,-c(7:11)], LA_2DG$table, y$FPKM_mean)
+write.table(expt, file = "../data/processed/03b_H3k18la.db.LA_2DG.tsv", sep = "\t", quote = F, row.names = F)
+
+
+# AC_2DG
+AC_2DG$table$qvalue <- qvalue(AC_2DG$table$PValue)$qvalue
+AC_2DG$table$FDR <- p.adjust(AC_2DG$table$PValue, method = "fdr")
+
+expt <- cbind(AC_2DG$genes[,-c(7:11)], AC_2DG$table, y$FPKM_mean)
+write.table(expt, file = "../data/processed/03b_H3k18la.db.AC_2DG.tsv", sep = "\t", quote = F, row.names = F)
+
+
+
+###############
+# Volcano plots
+###############
+
+# LA_2DG
+res_LA_2DG <- topTags(LA_2DG, n = Inf, sort.by = "logFC")$table %>% 
+  as.tibble() %>% 
+  rowwise() %>% 
+  mutate(label_gene = ifelse((FDR < 0.001 | logFC < -3) | (FDR < 0.05 & logFC > 1), SYMBOL, NA))
+ 
+res_LA_2DG_promPC <- res_LA_2DG %>% dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding")
+
+vp <- volPlot(res_LA_2DG_promPC, FC.nm = "logFC", FDR.nm = "FDR", fc = 1, fdr = 0.05, sym.lab = FALSE,
+                     expt.nm = "03b_H3K18LA_2DG", res.path = "../data/processed/", ret = T)
+
+vp <- vp +
+   geom_text_repel(aes(label = label_gene), size = 3, max.overlaps = Inf) 
+
+cowplot::ggsave2(filename = "../data/processed/03b_H3K18LA_2DG_vol.pdf", plot = vp,
+                 width = 8, height = 6)
+
+
+
+
+# AC_2DG
+res_AC_2DG <- topTags(AC_2DG, n = Inf, sort.by = "logFC")$table %>% 
+  as.tibble() %>% 
+  rowwise() %>% 
+  mutate(label_gene = ifelse((FDR < 0.002 | (FDR < 0.05 & logFC < -2) | (FDR < 0.05 & logFC > 1)), SYMBOL, NA))
+ 
+res_AC_2DG_promPC <- res_AC_2DG %>% dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding")
+
+vp <- volPlot(res_AC_2DG_promPC, FC.nm = "logFC", FDR.nm = "FDR", fc = 1, fdr = 0.05, sym.lab = FALSE,
+                     expt.nm = "03b_H3K27AC_2DG", res.path = "../data/processed/", ret = T)
+
+vp <- vp +
+   geom_text_repel(aes(label = label_gene), size = 3, max.overlaps = Inf) 
+
+cowplot::ggsave2(filename = "../data/processed/03b_H3K27AC_2DG_vol.pdf", plot = vp,
+                 width = 8, height = 6)
+
+
+```
+
+
+################################################################################
+### Make Heatmap of DB Prom PC genes - Figure S4
+################################################################################
+```{r}
+
+db_goi <- rbind(res_LA_2DG_promPC %>%
+              dplyr::filter(abs(logFC)>1, FDR < 0.05, annotation == "Promoter", transcriptBiotype == "protein_coding") %>% as.data.frame(),
+            res_AC_2DG_promPC %>%
+              dplyr::filter(abs(logFC)>1, FDR < 0.05, annotation == "Promoter", transcriptBiotype == "protein_coding") %>% as.data.frame())
+
+LA_db_goi <- rbind(res_LA_2DG_promPC %>%
+              dplyr::filter(abs(logFC)>1, FDR < 0.05, annotation == "Promoter", transcriptBiotype == "protein_coding") %>% as.data.frame())
+
+AC_db_goi <- rbind(res_AC_2DG_promPC %>%
+              dplyr::filter(abs(logFC)>1, FDR < 0.05, annotation == "Promoter", transcriptBiotype == "protein_coding") %>% as.data.frame())
+
+
+db_goi <- db_goi %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(!duplicated(peakID))
+
+LA_db_goi <- LA_db_goi %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(!duplicated(peakID))
+
+AC_db_goi <- AC_db_goi %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(!duplicated(peakID))
+
+# Filter quant binding for sig DB peaks
+dat <- cbind(h3k18la.dge.filt$genes, h3k18la.dge.filt$FPKM_mean) %>%
+  as.data.frame() %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(peakID %in% db_goi$peakID)
+
+LA_dat <- cbind(h3k18la.dge.filt$genes, h3k18la.dge.filt$FPKM_mean) %>%
+  as.data.frame() %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(peakID %in% LA_db_goi$peakID)
+
+AC_dat <- cbind(h3k18la.dge.filt$genes, h3k18la.dge.filt$FPKM_mean) %>%
+  as.data.frame() %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>%
+  dplyr::filter(peakID %in% AC_db_goi$peakID)
+
+# Tidy the table
+dat.tidy <- dat %>%
+  dplyr::select(SYMBOL, peakID, H3K18LA_CNTRL, H3K18LA_2DG, H3K27AC_CNTRL, H3K27AC_2DG) %>%
+  gather(Sample, RPKM, -SYMBOL, -peakID)
+
+dat.tidy$RPKM <- log2(dat.tidy$RPKM + 1)
+dat.tidy$Sample <- factor(dat.tidy$Sample, levels = colnames(dat)[20:23])
+
+# LA
+LA_dat.tidy <- LA_dat %>%
+  dplyr::select(SYMBOL, peakID, H3K18LA_CNTRL, H3K18LA_2DG) %>%
+  gather(Sample, RPKM, -SYMBOL, -peakID)
+
+LA_dat.tidy$RPKM <- log2(LA_dat.tidy$RPKM + 1)
+LA_dat.tidy$Sample <- factor(LA_dat.tidy$Sample, levels = colnames(dat)[20:21])
+
+#AC
+AC_dat.tidy <- AC_dat %>%
+  dplyr::select(SYMBOL, peakID, H3K27AC_CNTRL, H3K27AC_2DG) %>%
+  gather(Sample, RPKM, -SYMBOL, -peakID)
+
+AC_dat.tidy$RPKM <- log2(AC_dat.tidy$RPKM + 1)
+AC_dat.tidy$Sample <- factor(AC_dat.tidy$Sample, levels = colnames(dat)[22:23])
+
+###################
+# Sort by Heirarchical clustering using Ward's method with Euclidean distanced
+distfunc <- function(x) dist(x,method="euclidean")
+hclustfunc <- function(x) hclust(x, method="ward.D2")
+
+#Get distance and heirarchical clustering
+d <- distfunc(as.matrix(dat[,20:21]))
+hc <- hclustfunc(d)
+
+d <- distfunc(as.matrix(AC_dat[,22:23]))
+hc <- hclustfunc(d)
+
+###################
+# Sort by PCA
+pca <- prcomp(dat[,20:23], center = T, scale. = F)
+pca.order <- order(pca$x[,1])
+
+LA_pca <- prcomp(LA_dat[,20:21], center = T, scale. = F)
+LA_pca.order <- order(LA_pca$x[,1])
+
+AC_pca <- prcomp(AC_dat[,22:23], center = T, scale. = F)
+AC_pca.order <- order(AC_pca$x[,1])
+
+
+###################################################################
+# Make Heatmap
+###################################################################
+
+# Make heatmap
+library(scales)
+lim = c(0,6)
+nm = "RPKM (log2)"
+mb.colors <- colorRampPalette(c("#023858","#3690c0", "#e0f3f8","#fff7bc","#fec44f","#ec7014",
+                                    "#fc4e2a","#bd0026","#800026"))(n=1000)
+
+# LA PCA
+tmp_dat <- LA_dat.tidy
+tmp_dat$peakID <- factor(tmp_dat$peakID,
+                                      levels = tmp_dat$peakID[(LA_pca.order)], ordered = T)
+
+pp <- ggplot(tmp_dat, aes(Sample, peakID)) +
+        geom_tile(aes(fill = RPKM), colour = "transparent") +
+        #scale_fill_gradient(high = "white", low = "steelblue", name = "CPM (log2)") +
+        scale_fill_gradientn(colours = mb.colors, name = nm, limits = lim, oob=squish) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_blank(),
+              panel.background = element_rect(fill = NA))
+
+cowplot::ggsave2(filename = "../data/processed/03b_Prom_pc_CT_LA_hm-PCA.pdf", plot = pp,
+                 width = 8, height = 6)
+
+# AC PCA
+tmp_dat <- AC_dat.tidy
+tmp_dat$peakID <- factor(tmp_dat$peakID,
+                                      levels = tmp_dat$peakID[rev(AC_pca.order)], ordered = T)
+
+pp <- ggplot(tmp_dat, aes(Sample, peakID)) +
+        geom_tile(aes(fill = RPKM), colour = "transparent") +
+        #scale_fill_gradient(high = "white", low = "steelblue", name = "CPM (log2)") +
+        scale_fill_gradientn(colours = mb.colors, name = nm, limits = lim, oob=squish) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_blank(),
+              panel.background = element_rect(fill = NA))
+
+cowplot::ggsave2(filename = "../data/processed/03b_Prom_pc_CT_AC_hm-PCA.pdf", plot = pp,
+                 width = 8, height = 6)
+
+
+```
+
+
+### Euler of DB with Timecourse - Figure S4
+```{r}
+library(ggVennDiagram)
+
+################
+# 2DG and SO in LA data
+
+venn_goi <- list(DG = res_LA_2DG_promPC %>% 
+                   dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>% 
+                   dplyr::select(SYMBOL) %>% 
+                   unique() %>% unlist() %>% as.vector(),
+                 TC = db_tc_sig_PromPC$SYMBOL %>% unique())
+
+
+library(eulerr)
+
+fit1 <- euler(c(
+  DG = 833,
+  TC = 4156,
+  "DG&TC" = 1014
+))
+
+p <-plot(fit1, quantities = TRUE)
+cowplot::ggsave2(filename = "../data/processed/03b_Prom_pc_DG-TC_euler.pdf", plot = p,
+                 width = 4, height = 3)
+
+```
+
+################################################################################
+### FGE of 2DG expts - Figure 6
+################################################################################
+```{r}
+
+library(clusterProfiler)
+library(enrichplot)
+library(org.Mm.eg.db)
+source(file.path(dest_tools_dir, "GO_leaf.R"))
+
+org = "org.Mm.eg.db"
+
+enrich_db <- "GO_220310"
+GOont <- "BP"
+top <- 10
+
+
+dir_enrich <- file.path(dir_export, paste0("03b_PromPC_v2_FuncGeneEnrich_", enrich_db, "_", GOont))
+dir.create(dir_enrich)
+
+
+# Prep the gene lists for the FGE loop
+goi_list <- list(LA_2DG = res_LA_2DG_promPC %>% 
+                   dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>% 
+                   dplyr::select(SYMBOL) %>% 
+                   unique() %>% unlist() %>% as.vector(),
+                 AC_2DG = res_AC_2DG_promPC %>% 
+                   dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>% 
+                   dplyr::select(SYMBOL) %>% 
+                   unique() %>% unlist() %>% as.vector())
+
+univ <- h3k18la.dge.filt$genes %>% 
+  dplyr::filter(annotation == "Promoter", transcriptBiotype == "protein_coding") %>% 
+  dplyr::select(SYMBOL) %>% 
+  unique() %>% unlist() %>% as.vector()
+
+enrich_results <- clusterProfiler::compareCluster(geneClusters = goi_list, fun = "enrichGO",
+                                            keyType = "SYMBOL", ont = GOont, OrgDb = org, universe = univ)
+
+
+# Filter enrichment for significance
+enrich_results_filt <- enrich_results@compareClusterResult %>% dplyr::filter(p.adjust < 0.05, Count > 3)
+
+# Fix the Ratio
+enrich_results_filt_fix <- enrich_results_filt %>%
+  as.data.frame() %>%
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>%
+  rowwise() %>%
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Export the FGE results table
+tmp <- enrich_results_filt_fix[,-11]
+
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_LA-AC_full.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+# Get leaf terms
+enrich_results_leaf <- GO_leaf(enrich_results_filt, query = 1, id.col = 2, ont = GOont)
+
+# Fix the Ratio
+enrich_results_leaf_fix <- enrich_results_leaf %>%
+  as.data.frame() %>%
+  mutate(tmp_col = str_split(GeneRatio, pattern = "/")) %>%
+  rowwise() %>%
+  mutate(Ratio = as.numeric(unlist(tmp_col)[1]) / as.numeric(unlist(tmp_col)[2]))
+
+# Export the FGE results table
+tmp <- enrich_results_leaf_fix[,-11]
+# Export the enrichment analysis
+write.table(tmp, file = file.path(dir_enrich, paste0(enrich_db, "_", GOont, "_LA-AC_leaf.tsv")),
+              quote = F, row.names = F, sep = "\t")
+
+# Get top 5 pathways per cell type to get union set of pathways
+top5_union <- enrich_results_leaf %>%
+  group_by(Cluster) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = top)
+
+
+# Filter the full table for the union of top5 pathways
+top5_enrich <- enrich_results_filt_fix %>%
+  dplyr::filter(ID %in% (top5_union$ID %>% unique()))
+
+# Prep the df for plotting
+top5_enrich <- top5_enrich %>%
+  arrange(Cluster, p.adjust)
+top5_enrich$Description <- substring(top5_enrich$Description, 1, 60)
+top5_enrich$Description <- factor(top5_enrich$Description, levels = rev(unique(top5_enrich$Description)))
+top5_enrich$p.adjust <- -log10(top5_enrich$p.adjust)
+
+# Make plot
+pp <- ggplot(top5_enrich, aes(Cluster, Description, colour = p.adjust)) +
+    geom_point(aes(size = Ratio)) +
+    theme_bw() +
+    scale_colour_gradient(low = "#3B9AB2", high = "#F21A00", name = "P Value\n-log10", limits=c(0,10), oob = scales::squish) +
+    guides(size=guide_legend(title="Ratio")) +
+    theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1)) +
+    ggtitle(paste0("H3K18la and H3K27ac Peaks in 2DG explants"))
+
+#Open the pdf device
+cowplot::ggsave2(plot = pp, filename = file.path(dir_enrich, paste0("LA-AC_FGE_top_", top, "_leaf_dotplot.pdf")),
+                 height = top5_enrich$Description %>% unique() %>% length() / 10 + 2.5,
+                 width = 6)
+```
+
+
+################################################################################
+### RNA-seq and H3K18La DB binding integration - Figure 6
+################################################################################
+```{r}
+
+tmp_db <- res_LA_2DG_promPC %>% 
+  as.data.frame() %>% 
+  arrange(desc(F)) %>% 
+  dplyr::filter(!duplicated(geneId))
+
+rna_db_merge <- inner_join(rna_de_res, tmp_db, by = c("ens_id" = "geneId"))
+
+rna_db_merge <- rna_db_merge %>% mutate(sig_de = ifelse((abs(logFC.x) > 1 & FDR.x < 0.05) & (abs(logFC.y) > 1 & FDR.y < 0.05), "both",
+                                                        ifelse(abs(logFC.x) > 1 & FDR.x < 0.05, "RNA",
+                                                               ifelse(abs(logFC.y) > 1 & FDR.y < 0.05, "CUT&Tag", "NA"))))
+rna_db_merge <- rna_db_merge %>% mutate(label_gene = ifelse(sig_de == "both", SYMBOL, NA))
+
+dat <- rna_db_merge %>%
+  mutate(rna_sig = ifelse((abs(logFC.x) >= 1 & FDR.x < 0.05), "sig", NA),
+         cuttag_sig = ifelse((abs(logFC.y) >= 1 & FDR.y < 0.05), "sig", NA)) 
+  
+
+bp_all <- ggplot(dat, aes(x = logFC.y, y = logFC.x, color = sig_de, alpha = sig_de)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = c("both" = "#F8766D", "CUT&Tag" = "#00BA38", "RNA" = "#619CFF", "NA" = "grey80"), name = "Significant") +
+  scale_alpha_manual(values=c("both" = 1, "CUT&Tag" = 1, "RNA" = 1, "NA" = 0.1)) +
+  geom_text_repel(aes(label = label_gene), size = 3, max.overlaps = Inf) +
+  xlim(-4,2) +
+  ggtitle("2-DG RNAseq vs H3K18La CUT&Tag") +
+  xlab("CUT&Tag 2-DG vs Control (logFC)") +
+  ylab("RNAseq 2-DG vs Control (logFC)")
+
+cowplot::ggsave2(filename = file.path(dir_export, paste0("03b", "_2DG_RNA-CUTtag-LA_point_all.pdf")), plot = bp_all,
+                   width = 5, height = 4)
+
+  
+bp_sig <- ggplot(dat %>% dplyr::filter(rna_sig == "sig" | cuttag_sig == "sig"), 
+                 aes(x = logFC.y, y = logFC.x, color = sig_de)) +
+  geom_point() +
+  scale_color_manual(values = c("both" = "#F8766D", "CUT&Tag" = "#00BA38", "RNA" = "#619CFF", "NA" = "grey95"), name = "Significant") +
+  scale_alpha_manual(values=c(1, 1, 1, 0.1)) +
+  geom_text_repel(aes(label = label_gene), size = 3, max.overlaps = Inf) +
+  xlim(-4,2) +
+  ggtitle("2-DG RNAseq vs H3K18La CUT&Tag") +
+  xlab("CUT&Tag 2-DG vs Control (logFC)") +
+  ylab("RNAseq 2-DG vs Control (logFC)")
+
+cowplot::ggsave2(filename = file.path(dir_export, paste0("03b", "_2DG_RNA-CUTtag-LA_point_sig.pdf")), plot = bp_sig,
+                   width = 4, height = 3)
+
+```
+
+################################################################################
+### RNA-seq and H3K27ac DB binding integration - Figure 6
+################################################################################
+```{r}
+
+tmp_db <- res_AC_2DG_promPC %>% 
+  as.data.frame() %>% 
+  arrange(desc(F)) %>% 
+  dplyr::filter(!duplicated(geneId))
+
+rna_db_merge <- inner_join(rna_de_res, tmp_db, by = c("ens_id" = "geneId"))
+
+rna_db_merge <- rna_db_merge %>% mutate(sig_de = ifelse((abs(logFC.x) > 1 & FDR.x < 0.05) & (abs(logFC.y) > 1 & FDR.y < 0.05), "both",
+                                                        ifelse(abs(logFC.x) > 1 & FDR.x < 0.05, "RNA",
+                                                               ifelse(abs(logFC.y) > 1 & FDR.y < 0.05, "CUT&Tag", "NA"))))
+rna_db_merge <- rna_db_merge %>% mutate(label_gene = ifelse(sig_de == "both", SYMBOL, NA))
+
+dat <- rna_db_merge %>%
+  mutate(rna_sig = ifelse((abs(logFC.x) >= 1 & FDR.x < 0.05), "sig", NA),
+         cuttag_sig = ifelse((abs(logFC.y) >= 1 & FDR.y < 0.05), "sig", NA)) 
+  
+
+bp_all <- ggplot(dat, aes(x = logFC.y, y = logFC.x, color = sig_de, alpha = sig_de)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = c("both" = "#F8766D", "CUT&Tag" = "#00BA38", "RNA" = "#619CFF", "NA" = "grey80"), name = "Significant") +
+  scale_alpha_manual(values=c("both" = 1, "CUT&Tag" = 1, "RNA" = 1, "NA" = 0.1)) +
+  geom_text_repel(aes(label = label_gene), size = 3, max.overlaps = Inf) +
+  xlim(-4,2) +
+  ggtitle("2-DG RNAseq vs H3K27Ac CUT&Tag") +
+  xlab("CUT&Tag 2-DG vs Control (logFC)") +
+  ylab("RNAseq 2-DG vs Control (logFC)")
+
+cowplot::ggsave2(filename = file.path(dir_export, paste0("03b", "_2DG_RNA-CUTtag-AC_point_all.pdf")), plot = bp_all,
+                   width = 5, height = 4)
+```
+
+
+
+################################################################################
+### Perform quant of 2-DG analysis using TimeCourse DB peaks
+################################################################################
+
+
+```{r}
+library(csaw)
+
+gr <- makeGRangesFromDataFrame(db_tc_sig_PromPC, keep.extra.columns = TRUE)
+
+# Perform region counts
+pe.param <- readParam(max.frag=600, pe="both", minq = 20, dedup = T)
+
+h3k18la_tc.counts <- regionCounts(meta$bams, gr, ext=150, param=pe.param)
+
+
+```
+
+
+### Make a heatmap of 2-DG projected on TimeCourse DB genes
+```{r}
+
+# Make DGE list object
+
+h3k18la_tc.dge <- asDGEList(h3k18la_tc.counts,
+               norm.factors = h3k18la_se$norm.factors,
+               group = meta$Group,
+               genes = as.data.frame(gr))
+colnames(h3k18la_tc.dge) <- paste(meta$Group, meta$Rep, sep = "_")
+
+
+h3k18la_tc.dge$samples$Run <- meta$Run
+
+h3k18la_tc.dge$logCPM <- log2(cpm(h3k18la_tc.dge) + 1)
+h3k18la_tc.dge$logFPKM <- rpkm(h3k18la_tc.dge, gene.length = "width", normalized.lib.sizes = T, log = T, prior.count = 1)
+h3k18la_tc.dge$FPKM <- rpkm(h3k18la_tc.dge, gene.length = "width", normalized.lib.sizes = T, log = F)
+h3k18la_tc.dge$FPKM_mean <- h3k18la_tc.dge$FPKM %>% 
+  as_tibble() %>% 
+  rowwise() %>% 
+  transmute(H3K18LA_CNTRL = mean(c(H3K18LA_CNTRL_R1, H3K18LA_CNTRL_R2, H3K18LA_CNTRL_R3)),
+         H3K18LA_2DG = mean(c(H3K18LA_2DG_R1, H3K18LA_2DG_R2, H3K18LA_2DG_R3)),
+         H3K27AC_CNTRL = mean(c(H3K27AC_CNTRL_R1, H3K27AC_CNTRL_R2)),
+         H3K27AC_2DG = mean(c(H3K27AC_2DG_R1, H3K27AC_2DG_R2)))
+
+# Export RPKM quant
+tmp <- cbind(h3k18la_tc.dge$genes, h3k18la_tc.dge$FPKM_mean)
+write.table(tmp, file = "../data/processed/03b_DG_tc_db_quant_rpkm.tsv", sep = "\t", quote = F, col.names = F, row.names = F)
+
+
+# Make a heatmap
+dat.tmp <- cbind(h3k18la_tc.dge$genes, h3k18la_tc.dge$FPKM_mean) %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_"))
+
+
+dat.tidy <- dat.tmp %>%
+  mutate(peakID = paste(seqnames, start, end, sep = "_")) %>% 
+  dplyr::select(SYMBOL, peakID, P28, H3K18LA_CNTRL, H3K18LA_2DG) %>%
+  gather(Sample, RPKM, -SYMBOL, -peakID) %>% 
+  mutate(RPKM = log2(RPKM + 1))
+
+dat.tidy$Sample <- factor(dat.tidy$Sample, levels = dat.tidy$Sample %>% unique())
+
+# P28 order
+ord_p28 <- dat.tmp %>% 
+  arrange(P28) %>% 
+  dplyr::select(peakID) %>% 
+  unlist() %>% as.vector()
+
+# HC clustering
+d <- distfunc(as.matrix(dat.tmp %>% dplyr::select(P28, H3K18LA_CNTRL, H3K18LA_2DG)))
+hc <- hclustfunc(d)
+ord_hc <- dat.tmp$peakID[hc$order]
+
+# PCA ordering
+pca.tmp <- prcomp(dat.tmp %>% dplyr::select(P28, H3K18LA_CNTRL, H3K18LA_2DG), center = T, scale. = T)
+ord_pca <- dat.tmp$peakID[order(pca.tmp$x[,1])]
+
+
+library(scales)
+lim = c(0,8)
+nm = "RPKM (log2)"
+mb.colors <- colorRampPalette(c("#023858","#3690c0", "#e0f3f8","#fff7bc","#fec44f","#ec7014",
+                                    "#fc4e2a","#bd0026","#800026"))(n=1000)
+
+# Sort by order in Fig 3
+peakID_ord <- readRDS("/Volumes/data/People/brooksma/PEGASUS/Projects/Gaur/Analysis/cutntag_240522/240911/data/interim/DB_Prom-PC_peakID_PCA_ord.Rds")
+
+tmp_dat <- dat.tidy
+tmp_dat$peakID <- factor(tmp_dat$peakID,
+                                      levels = peakID_ord$peakID, ordered = T)
+
+pp <- ggplot(tmp_dat, aes(Sample, peakID)) +
+        geom_tile(aes(fill = RPKM), colour = "transparent") +
+        #scale_fill_gradient(high = "white", low = "steelblue", name = "CPM (log2)") +
+        scale_fill_gradientn(colours = mb.colors, name = nm, limits = lim, oob=squish) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_blank(),
+              panel.background = element_rect(fill = NA))
+
+cowplot::ggsave2(filename = "../data/processed/03b_Prom_pc_TC-DG_hm-Fig5Border.pdf", plot = pp,
+                 width = 8, height = 6)
+
+```
