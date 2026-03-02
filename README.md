@@ -9,7 +9,7 @@ H3K18La CUT&Tag data for retina explant glucose and 2-DG experiments is availabl
 
 H3K18La RNA-seq data for retina explant glucose experiment is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE291663). 
 
-H3K18La RNA-seq data for retina explant 2-DG experiment is available from NCBI's GEO database ().
+H3K18La RNA-seq data for retina explant 2-DG experiment is available from NCBI's GEO database (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE322475).
 
 
 ### Scripts
