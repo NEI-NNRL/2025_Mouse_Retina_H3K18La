@@ -1,4 +1,4 @@
-# 2025_Mouse_Retina_H3K18La
+# 2026_Mouse_Retina_H3K18La
 This repository is associated with the manuscript, "Lactate and histone H3K18 lactylation are associated with metabolic control of gene expression in the retina" by Gaur, et al. 2026
 
 ### **Data**
